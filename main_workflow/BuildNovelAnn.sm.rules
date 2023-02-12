@@ -1,0 +1,290 @@
+import os
+curDir = os.getcwd()
+include: "RNA_seq.sm.rules"
+
+NOVEL_ANN_BASE = os.path.join("analysis", "novel_ann")
+rule stringtie_ann:
+    input:
+        bam = rules.RNA_seq_mapping.output.bam,
+        merge_bed = REF_GENE_BED,
+        gtf = REF_GTF,
+    output:
+        ann = os.path.join(NOVEL_ANN_BASE, "stringtie_ann", "{tp}.{SRR}.gtf"),
+    shell:
+        """
+rule_text=$(infer_experiment.py -i {input.bam} -r {input.merge_bed} | grep -e "[+-]")
+
+indx=0
+for word in ${{rule_text[@]}}; do
+    let "indx = indx + 1"
+    if [[ ${{indx}} = 6 ]]; then
+        rule1=${{word:1:-2}}
+    elif [[ ${{indx}} = 7 ]]; then
+        score1=${{word}}
+    elif [[ ${{indx}} = 13 ]]; then
+        rule2=${{word:1:-2}}
+    elif [[ ${{indx}} = 14 ]]; then
+        score2=${{word}}
+    fi
+done
+
+if [[ `awk "BEGIN{{print(${{score1}}>${{score2}})?"1":"0"}}"` = 1 ]]; then
+    rule=${{rule1}}
+    score=${{score1}}
+    unrule_score=${{score2}}
+else
+    rule=${{rule2}}
+    score=${{score2}}
+    unrule_score=${{score1}}
+fi
+
+echo "file: {input.bam}  rule: ${{rule}}  score: ${{score}}"
+if [[ `awk "BEGIN{{print(${{score}}-${{unrule_score}}>0.3)?"1":"0"}}"` = 0 ]]; then
+    mode=1
+else
+    mode=2
+fi
+
+if [[ ${{mode}} = 1 ]]; then
+    rule_parm=""
+else
+    if [[ ${{rule}} = "++,--" || ${{rule}} == "1++,1--,2+-,2-+" ]]; then
+        rule_parm="--rf"
+    else
+        rule_parm="--fr"
+    fi
+fi
+
+stringtie ${{rule_parm}} -G {input.gtf} -p 28 -o {output.ann} {input.bam}
+        """
+
+rule merge_stringtie_ann:
+    input:
+        res = [rules.stringtie_ann.output.ann.format(tp=tp, SRR=SRR) for tp in OVULE_RNA_SEQ_DATA.keys() for SRR in OVULE_RNA_SEQ_DATA[tp]],
+    output:
+        merged = os.path.join(NOVEL_ANN_BASE, "stringtie_merge", "merged.gtf"),
+    shell:
+        """
+stringtie --merge -p 28 -o {output.merged} {input.res}
+        """
+
+rule build_taco_cfg:
+    input:
+        res = [rules.stringtie_ann.output.ann.format(tp=tp, SRR=SRR) for tp in OVULE_RNA_SEQ_DATA.keys() for SRR in OVULE_RNA_SEQ_DATA[tp]],
+    output:
+        cfg = os.path.join(NOVEL_ANN_BASE, "taco.cfg"),
+    run:
+        with open(output.cfg, "w") as f:
+            for tp in OVULE_RNA_SEQ_DATA.keys():
+                for SRR in OVULE_RNA_SEQ_DATA[tp]:
+                    res = rules.stringtie_ann.output.ann.format(tp=tp, SRR=SRR)
+                    f.write("{0}\n".format(res))
+
+rule merge_stringtie_ann_by_taco:
+    input:
+        cfg = rules.build_taco_cfg.output.cfg,
+    output:
+        merged = os.path.join(NOVEL_ANN_BASE, "taco_merge", "assembly.bed"),
+    params:
+        out_dir = os.path.join(NOVEL_ANN_BASE, "taco_merge"),
+    shell:
+        """
+source activate py27
+if [[ -e {params.out_dir} ]]; then
+    rm -rf {params.out_dir}
+fi
+taco_run -o {params.out_dir} --filter-min-length 500 -p 28 {input.cfg}
+        """
+
+rule rename_taco_iso:
+    input:
+        taco = rules.merge_stringtie_ann_by_taco.output.merged,
+    output:
+        rename = os.path.join(NOVEL_ANN_BASE, "taco_merge", "assembly.rename.bed"),
+    run:
+        from pybicl.io import iterline
+        import re
+        with open(output.rename, "w") as f:
+            for line in iterline(input.taco):
+                data = line.split("\t")
+                name = data[3]
+                gid, tid = re.findall("(G\d+)\|(TU\d+)", name)[0]
+                data[3] = gid + "." + tid
+                f.write("\t".join(data))
+
+rule find_novel_taco_ann:
+    input:
+        taco = rules.rename_taco_iso.output.rename,
+        ann = REF_BED,
+        twoBit = GENOME_2bit,
+    output:
+        novel_taco = os.path.join(NOVEL_ANN_BASE, "novel_taco", "assembly.bed"),
+        fa = os.path.join(NOVEL_ANN_BASE, "novel_taco", "assembly.fa"),
+    shell:
+        """
+source activate py35
+bed12overlap -t {input.taco} -c {input.ann} -n {output.novel_taco} -S
+mv {output.novel_taco}.not_overlap.bed {output.novel_taco}
+rm {output.novel_taco}.overlap.bed
+twoBitToFa -bed={output.novel_taco} {input.twoBit} {output.fa}
+        """
+
+rule cpat_pick_at_rna:
+    input:
+        "/home/wangdehe/common/NCBI/genomes/Arabidopsis_thaliana/GCA_000001735.1_TAIR10_genomic.gbff"
+    output:
+        mrna = os.path.join(NOVEL_ANN_BASE, "cpat", "data", "At", "mrna.fa"),
+        ncrna = os.path.join(NOVEL_ANN_BASE, "cpat", "data", "At", "ncrna.fa"),
+    shell:
+        """
+source activate py35
+genbank2rna -i {input} --mrna {output.mrna} --ncrna {output.ncrna}
+        """
+
+rule cpat_make_at_hexamer:
+    input:
+        mrna = rules.cpat_pick_at_rna.output.mrna,
+        ncrna = rules.cpat_pick_at_rna.output.ncrna,
+    output:
+        os.path.join(NOVEL_ANN_BASE, "cpat", "data", "At", "rna.hexamer"),
+    shell:
+        """
+source activate py35
+make_hexamer_tab.py -c {input.mrna} -n {input.ncrna} > {output}
+        """
+
+rule cpat_make_at_logitModel:
+    input:
+        mrna = rules.cpat_pick_at_rna.output.mrna,
+        ncrna = rules.cpat_pick_at_rna.output.ncrna,
+        hexamer = rules.cpat_make_at_hexamer.output,
+    output:
+        os.path.join(NOVEL_ANN_BASE, "cpat", "data", "At", "rna.mode.logit.RData"),
+    params:
+        model_name = os.path.join(NOVEL_ANN_BASE, "cpat", "data", "At", "rna.mode"),
+    priority: 80
+    shell:
+        """
+source activate py35
+make_logitModel.py -c {input.mrna} -n {input.ncrna} -x {input.hexamer} -o {params.model_name}
+        """
+
+rule cpat_novel:
+    input:
+        iso = rules.find_novel_taco_ann.output.novel_taco,
+        genome = GENOME_FA,
+        hexamer = rules.cpat_make_at_hexamer.output,
+        model = rules.cpat_make_at_logitModel.output,
+    output:
+        os.path.join(NOVEL_ANN_BASE, "cpat", "taco_novel.cpat.out.tsv"),
+    params:
+        work_folder = os.path.join(NOVEL_ANN_BASE, "cpat"),
+    priority: 80
+    shell:
+        """
+if [[ ! -e {params.work_folder} ]]; then
+    mkdir {params.work_folder}
+fi
+cpat.py -g {input.iso} -x {input.hexamer} -d {input.model} -r {input.genome} -o {output}
+        """
+
+rule taco_novel_ncbi_orffinder:
+    input:
+        iso_fa = rules.find_novel_taco_ann.output.fa,
+    output:
+        gff = os.path.join(NOVEL_ANN_BASE, "orffinder", "taco_novel.gff"),
+    params:
+        work_folder = os.path.join(NOVEL_ANN_BASE, "orffinder"),
+        curDir = curDir,
+    shell:
+        r"""
+if [[ ! -e {params.work_folder} ]]; then
+    mkdir {params.work_folder}
+fi
+ssh mu01 "cd {params.curDir}; ORFfinder -in {input.iso_fa} -ml 30 -strand plus -s 0 -outfmt 0 -out {params.work_folder}/isoAll.faa"
+cat <(echo "method name:start:end-dec") <(grep -e ">" {params.work_folder}/isoAll.faa) | awk '{{FS="|"}}{{print $2}}' | sed 's/ORF[0-9]*_//g' | awk '{{print $1}}' | awk '{{FS=":"}}{{OFS="\t"}}{{print $1, $2, $3, $3-$2}}' | sed -n '2,$p' | sort -S 2G -k 1,1 -k 4,4nr | sort -S 2G -u -k 1,1 | awk '{{FS=OFS="\t"}}{{if($4>60){{print $1, "ORFfinder", "CDS", $2+1, $3+1, 0, "+", 0, "gene_id="NR", CDS_length="$4+1}}}}' > {output.gff}
+        """
+
+rule add_cds2novel_iso:
+    input:
+        iso = rules.find_novel_taco_ann.output.novel_taco,
+        cpat = rules.cpat_novel.output,
+        orffinder = rules.taco_novel_ncbi_orffinder.output.gff,
+    output:
+        iso_with_cds = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "taco_novel.with_cds.bed12"),
+    params:
+        work_folder = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene"),
+        coding_prob_cutoff = 0.5,
+    shell:
+        """
+source activate py35
+cat {input.cpat} | awk '{{FS=OFS="\t"}}{{if($6>={params.coding_prob_cutoff}){{print $1}}}}' | sort -S 2G -k 1,1 > {params.work_folder}/coding_gene.txt
+join -1 1 -2 1 {params.work_folder}/coding_gene.txt  {input.orffinder} | awk '{{OFS="\t"}}{{print $1, $2, $3, $4, $5, $6, $7, $8, $9" "$10}}' > {params.work_folder}/coding.cds.gff
+genemark2bed12 -i {input.iso} -o {output.iso_with_cds} --cds {params.work_folder}/coding.cds.gff
+        """
+
+rule build_novel_gene_info:
+    input:
+        novel_iso = rules.add_cds2novel_iso.output.iso_with_cds,
+        genome = GENOME_2bit,
+    output:
+        fa = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.iso.fa"),
+        gtf = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.iso.sort.gtf"),
+        gene = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.iso.gene.bed6"),
+        cds = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.cds.sort.bed12"),
+        cds_fa = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.cds.fa"),
+        cds_faa = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.cds.faa"),
+        uniq_cds = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "novel.cds.uniq.bed12"),
+    params:
+        work_folder = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene"),
+    shell:
+        """
+source activate py35
+iso2gene -i {input.novel_iso} -o {output.gene}
+twoBitToFa -bed={input.novel_iso} {input.genome} {output.fa}
+bed12Togtf -i {input.novel_iso} -o {output.gtf}
+iso2cds -i {input.novel_iso} -o {output.cds}
+twoBitToFa -bed={output.cds} {input.genome} {output.cds_fa}
+translateFa -i {output.cds_fa} -o {output.cds_faa}
+cat {output.cds} | sort -S 2G -u -k 1,1 -k 2,2n -k 3,3n -k 6,6 -k 11,11 -k 12,12 > {output.uniq_cds}
+        """
+
+rule novel_NR:
+    input:
+        faa = rules.build_novel_gene_info.output.cds_faa,
+    output:
+        blast_out = os.path.join(NOVEL_ANN_BASE, "NR", "blast.novel.out"),
+        res = os.path.join(NOVEL_ANN_BASE, "NR", "NR.novel.tsv"),
+    params:
+        e_val = 1e-3,
+        identity = 0.5,
+        blast_db = BLAST_DB["NR"],
+        blastout2ann = "python3 scripts/annotation/blastout2ann.py",
+        prefix = os.path.join(NOVEL_ANN_BASE, "NR", "blast14"),
+    priority: 30
+    shell:
+        """
+blastp -query {input.faa} -out {output.blast_out} -db {params.blast_db} -evalue 1e-6 -outfmt 5 -num_threads 28
+source activate py35
+{params.blastout2ann} -i {output.blast_out} -o {output.res} --e-val {params.e_val} --identity {params.identity}
+Blast5ToBlast14 -i {output.blast_out} -o {params.prefix}
+        """
+
+rule merge_novel_ann:
+    input:
+        ref_bed = REF_BED,
+        ref_gtf = REF_GTF,
+        ref_gene = REF_GENE_BED,
+        novel_bed = rules.add_cds2novel_iso.output.iso_with_cds,
+        novel_gtf = rules.build_novel_gene_info.output.gtf,
+        novel_gene = rules.build_novel_gene_info.output.gene,
+    output:
+        bed = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "merge.iso.bed12"),
+        gtf = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "merge.iso.gtf"),
+        gene = os.path.join(NOVEL_ANN_BASE, "taco_noval_gene", "merge.iso.bed6"),
+    shell:
+        """
+cat {input.ref_bed} {input.novel_bed} | sort -k 1,1 -k 2,2n > {output.bed}
+cat {input.ref_gtf} {input.novel_gtf} > {output.gtf}
+cat {input.ref_gene} {input.novel_gene} | sort -k 1,1 -k 2,2n > {output.gene}
+        """

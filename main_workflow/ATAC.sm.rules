@@ -1,0 +1,908 @@
+import os
+curDir = os.getcwd()
+include: "MetaInfo.sm.rules"
+
+TF_MOTIF_BASE = {
+    "gosHir": "/home/wangdehe/common/PlantTFDB/tf_binding_motif/gosHir/individual",
+    "At": "/home/wangdehe/common/PlantTFDB/tf_binding_motif/At/individual"
+}
+PLANTTFDB_MEME = dict()
+for key, value in TF_MOTIF_BASE.items():
+    PLANTTFDB_MEME[key] = glob_wildcards(os.path.join(TF_MOTIF_BASE[key], "{name}.meme"))[0]
+
+ATAC_PEAK = os.path.join("analysis_v3", "cellranger_atac", "Merge", "outs", "peaks.bed")
+ATAC_PEAK_DE = os.path.join("analysis_v3", "stat", "ATAC", "ATAC.peak.DE.tsv")
+ATAC_GENE_DE = os.path.join("analysis_v3", "stat", "ATAC", "ATAC.gene.DE.tsv")
+ATAC_PEAK_DE_MACS2 = os.path.join("analysis_v3", "stat", "ATAC_MACS2", "ATAC.peak.DE.tsv")
+ATAC_PEAK_WEAK_DE_MACS2 = os.path.join("analysis_v3", "stat", "ATAC_MACS2", "ATAC.peak.weakDE.tsv")
+ATAC_GENE_DE_MACS2 = os.path.join("analysis_v3", "stat", "ATAC_MACS2", "ATAC.gene.DE.tsv")
+
+rule fetch_ATAC:
+    input:
+        peak = ATAC_PEAK,
+        genome = GENOME_2bit,
+        sizes = CHROM_SIZE,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "data", "ATAC.bed6"),
+        fa = os.path.join("analysis_v3", "ATAC", "data", "ATAC.fa"),
+    shell:
+        """
+cat {input.peak} | awk '{{FS=OFS="\t"}}{{ print $1, $2, $3, $1"_"$2"_"$3, 0, "." }}' > {output.bed}
+twoBitToFa -bed={output.bed} {input.genome} {output.fa}
+        """
+
+
+rule planttfdb_ATAC_binding_site:
+    input:
+        ATAC_fa = rules.fetch_ATAC.output.fa,
+        meme = os.path.join(TF_MOTIF_BASE["gosHir"], "{name}.meme")
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "binding_site", "{name}", "mast.xml")
+    params:
+        job_name = "plantTFDB_ATAC_binding_site",
+        walltime = "480:00:00",
+        nodes = "nodes=1:ppn=1",
+        log = "log",
+        queue = "All",
+        output_folder = os.path.join("analysis_v3", "ATAC", "binding_site", "{name}"),
+    priority: 100
+    shell:
+        "mast --oc {params.output_folder} {input.meme} {input.ATAC_fa}"
+
+rule summary_ATAC_tf_binding_site:
+    input:
+        res_li = expand(rules.planttfdb_ATAC_binding_site.output, name=PLANTTFDB_MEME["gosHir"]),
+        ref = REF_GENE_BED,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "binding_site", "merge.tsv"),
+    params:
+        expand = 1000,
+    run:
+        from pybicl.io import Xml, BedFile
+        from pybicl.operation import IvalTree
+        from pybicl.parser.xml import XmlBs4
+        ref_bed = BedFile(input.ref, "r")
+        ref_ival = IvalTree(False)
+        for rec in ref_bed.load():
+            ref_ival.add(rec.name, rec.chrom, rec.chromStart-params.expand, rec.chromEnd+params.expand, None)
+        with open(output.res, "w") as f:
+            header = "TF\tATAC_peak\tGid\tpvalue\tevalue\n"
+            f.write(header)
+            for tf in PLANTTFDB_MEME:
+                xml = Xml(rules.planttfdb_ATAC_binding_site.output.res.format(name=tf), "r")
+                root = xml.load(XmlBs4)
+                for hit in root.data.find_all("sequence"):
+                    target_peak = hit.attrs["name"]
+                    chrom1, chrom2, start, end = target_peak.split("_")
+                    chrom = chrom1 + "_" + chrom2
+                    overlap_genes = ref_ival.find(chrom, int(start), int(end), None)
+                    if overlap_genes:
+                        Gids=",".join(overlap_genes)
+                    else:
+                        Gids="NA"
+                    score = hit.find("score")
+                    pval = score.attrs["combined_pvalue"]
+                    eval = score.attrs["evalue"]
+                    f.write("\t".join([tf, target_peak, Gids, pval, eval])+"\n")
+
+rule filter_ATAC_bam:
+    input:
+        bam = os.path.join("analysis_v3", "cellranger_atac", "{sample}", "outs", "possorted_bam.bam"),
+        barcode = os.path.join("analysis_v3", "stat", "ATAC", "ATAC.{sample}.barcode.txt"),
+    output:
+        bam = os.path.join("analysis_v3", "ATAC", "filter_bam", "{sample}.sort.bam"),
+    params:
+        filter_bam = "python scripts/processing_atac/filter_bam.py",
+    shell:
+        """
+source activate py35
+{params.filter_bam} -i {input.bam} -b {input.barcode} -o {output.bam}
+samtools index {output.bam}
+        """
+
+rule ATAC_bam2bw:
+    input:
+        bam = rules.filter_ATAC_bam.output,
+        sizes = CHROM_SIZE,
+    output:
+        bw = os.path.join("analysis_v3", "ATAC", "bw", "{sample}.bw"),
+    params:
+        TOTAL_WIGSUM = 1000000000,
+        prefix = os.path.join("analysis_v3", "ATAC", "bw", "{sample}"),
+    shell:
+        """
+bam2wig.py -t {params.TOTAL_WIGSUM} -s {input.sizes} -i {input.bam} -o {params.prefix}
+wigToBigWig -clip {params.prefix}.wig {input.sizes} {output.bw}
+rm {params.prefix}.wig
+        """
+
+
+rule build_ATAC_HMMRATAC_genome_info:
+    input:
+        bam = rules.filter_ATAC_bam.output.bam,
+    output:
+        info = os.path.join("analysis_v3", "ATAC", "filter_bam", "{sample}.genome.info"),
+    shell:
+        """
+samtools view -H {input.bam} | perl -ne 'if(/^@SQ.*?SN:(\w+)\s+LN:(\d+)/){{print $1,"\t",$2,"\n"}}' > {output.info}
+        """
+
+rule ATAC_HMMRATAC:
+    input:
+        bam = rules.filter_ATAC_bam.output.bam,
+        info = rules.build_ATAC_HMMRATAC_genome_info.output.info,
+    output:
+        peak = os.path.join("analysis_v3", "ATAC", "HMMRATAC", "{sample}_peaks.gappedPeak"),
+        summits = os.path.join("analysis_v3", "ATAC", "HMMRATAC", "{sample}_summits.bed"),
+    params:
+        outdir = os.path.join("analysis_v3", "ATAC", "HMMRATAC", "{sample}"),
+        HMMRATAC = "/home/wangdehe/downloads/HMMRATAC_V1.2.10_exe.jar"
+    shell:
+        """
+java -jar -Xmx400G {params.HMMRATAC} -b {input.bam} -i {input.bam}.bai -g {input.info} -o {params.outdir}
+        """
+
+rule merge_ATAC_HMMRATAC_peak:
+    input:
+        peak = expand(rules.ATAC_HMMRATAC.output.peak, sample=["WT", "FL"]),
+    output:
+        core_peak = os.path.join("analysis_v3", "ATAC", "HMMRATAC", "merge.core.peak.bed3"),
+        broad_peak = os.path.join("analysis_v3", "ATAC", "HMMRATAC", "merge.broad.peak.bed3"),
+    shell:
+        """
+cat {input.peak} | awk '{{FS=OFS="\t"}}{{if($8-$7>50) print $1, $7, $8}}'| grep -v "-" | sort -k 1,1 -k 2,2n | bedtools merge -i - > {output.core_peak}
+cat {input.peak} | awk '{{FS=OFS="\t"}}{{if($3-$2>50) print $1, $2, $3}}'| grep -v "-" | sort -k 1,1 -k 2,2n | bedtools merge -i - > {output.broad_peak}
+        """
+
+rule cnt_ATAC_HMMRATAC_UMI:
+    input:
+        bam = rules.filter_ATAC_bam.output.bam,
+        peak = rules.merge_ATAC_HMMRATAC_peak.output.broad_peak,
+    output:
+        cnt = os.path.join("analysis_v3", "ATAC", "HMMRATAC_cnt", "{sample}.peak.cnt.tsv"),
+    params:
+        compute_ATAC_UMI = "python scripts/processing_atac/compute_ATAC_UMI.py",
+    shell:
+        """
+source activate py35
+mpiexec -n 60 {params.compute_ATAC_UMI} -i {input.bam} -o {output.cnt} --peak {input.peak}
+        """
+
+rule ATAC_HMMRATAC_peak2gene:
+    input:
+        cnt = rules.cnt_ATAC_HMMRATAC_UMI.output.cnt,
+        ref = "analysis/novel_ann/taco_noval_gene/merge.iso.bed6"
+    output:
+        cnt = os.path.join("analysis_v3", "ATAC", "HMMRATAC_cnt", "{sample}.gene.cnt.tsv"),
+    params:
+        peak_mat2gene = "python scripts/processing_atac/peak_mat2gene.py",
+    shell:
+        """
+source activate py35
+mpiexec -n 60 {params.peak_mat2gene} -i {input.cnt} -r {input.ref} -o {output.cnt}
+        """
+
+rule run_ATAC_HMMRATAC_peak2gene:
+    input:
+        expand(rules.ATAC_HMMRATAC_peak2gene.output, sample=["WT", "FL"])
+
+rule ATAC_MACS2:
+    input:
+        bam = rules.filter_ATAC_bam.output.bam,
+    output:
+        peak = os.path.join("analysis_v3", "ATAC", "MACS2", "{sample}", "NA_peaks.narrowPeak"),
+        summits = os.path.join("analysis_v3", "ATAC", "MACS2", "{sample}", "NA_summits.bed"),
+    params:
+        out_dir = os.path.join("analysis_v3", "ATAC", "MACS2", "{sample}"),
+        genome_size = "2e9",
+    shell:
+        "macs2 callpeak -t {input.bam} -g {params.genome_size} --outdir {params.out_dir} --nomodel --shift 100 --extsize 200 -B --SPMR --call-summits"
+
+rule merge_ATAC_MACS2_peak:
+    input:
+        WT = rules.ATAC_MACS2.output.peak.format(sample="WT"),
+        FL = rules.ATAC_MACS2.output.peak.format(sample="FL"),
+    output:
+        peak = os.path.join("analysis_v3", "ATAC", "MACS2", "merge.peak.bed3"),
+    shell:
+        "cat {input.WT} {input.FL} | sort -k 1,1 -k 2,2n | bedtools merge -i - > {output.peak}"
+
+rule ATAC_MACS2_peak2fa:
+    input:
+        peak = rules.merge_ATAC_MACS2_peak.output.peak,
+        genome = GENOME_2bit,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "data_MACS2", "ATAC.All.bed6"),
+        fa = os.path.join("analysis_v3", "ATAC", "data_MACS2", "ATAC.All.fa"),
+    shell:
+        """
+cat {input.peak} | awk '{{FS=OFS="\t"}}{{print $1, $2, $3, $1"_"$2"_"$3, 0, "."}}' > {output.bed}
+twoBitToFa -bed={output.bed} {input.genome} {output.fa}
+        """
+
+rule ATAC_peak2neaberby_promoter:
+    input:
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+        gene = REF_GENE_BED,
+    output:
+        stat = os.path.join("analysis_v3", "ATAC", "data_MACS2", "ATAC.neaberby_promoter.100.tsv"),
+    params:
+        expand = 100,
+    shell:
+        """
+echo "Gid\tATAC" > {output.stat}
+cat {input.gene} | awk '{{FS=OFS="\t"}}{{ if($6=="+"){{tss=$2}}else{{tss=$3-1}}; start_site=tss-{params.expand}; if(start_site<0){{start_site=0}}; print $1, start_site, tss+1+{params.expand}, $4, $5, $6 }}' | sort -k 1,1 -k 2,2n > {output.stat}.promoter.bed
+bedtools intersect -wb -a {input.peak} -b {output.stat}.promoter.bed | awk '{{FS=OFS="\t"}}{{print $10, $4}}' | sort >> {output.stat}
+rm {output.stat}.promoter.bed
+        """
+
+rule ATAC_promoter_profile:
+    input:
+        bw = rules.ATAC_bam2bw.output.bw,
+        gene = REF_GENE_BED,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "profile", "{sample}.promoter.tsv"),
+    params:
+        expand_len = 1000,
+    shell:
+        """
+source activate py35
+bw_profile reference-point --referencePoint TSS --bw {input.bw} --ref {input.gene} -o {output.res} --upstream {params.expand_len} --downstream {params.expand_len} --detail --resolution 1
+        """
+
+rule ATAC_TES_profile:
+    input:
+        bw = rules.ATAC_bam2bw.output.bw,
+        gene = REF_GENE_BED,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "profile", "{sample}.TES.tsv"),
+    params:
+        expand_len = 1000,
+    shell:
+        """
+source activate py35
+bw_profile reference-point --referencePoint TES --bw {input.bw} --ref {input.gene} -o {output.res} --upstream {params.expand_len} --downstream {params.expand_len} --detail --resolution 1
+        """
+
+
+rule plot_ATAC_promoter_profile:
+    input:
+        WT = os.path.join("analysis_v3", "ATAC", "profile", "WT.promoter.tsv"),
+        FL = os.path.join("analysis_v3", "ATAC", "profile", "FL.promoter.tsv"),
+    output:
+        plot = os.path.join("analysis_v3", "ATAC", "profile", "promoter_profile.pdf"),
+    params:
+        plot_ATAC_promoter_profile = "Rscript scripts/ATAC/plot_ATAC_promoter_profile.R"
+    shell:
+        """
+{params.plot_ATAC_promoter_profile} {input.WT} {input.FL} {output.plot}
+        """
+
+rule plot_ATAC_TES_profile:
+    input:
+        WT = os.path.join("analysis_v3", "ATAC", "profile", "WT.TES.tsv"),
+        FL = os.path.join("analysis_v3", "ATAC", "profile", "FL.TES.tsv"),
+    output:
+        plot = os.path.join("analysis_v3", "ATAC", "profile", "TES_profile.pdf"),
+    params:
+        plot_ATAC_promoter_profile = "Rscript scripts/ATAC/plot_ATAC_promoter_profile.R"
+    shell:
+        """
+{params.plot_ATAC_promoter_profile} {input.WT} {input.FL} {output.plot}
+        """
+
+rule ATAC_peak_promoter_profile:
+    input:
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+        gene = REF_GENE_BED,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "peak_profile", "{sample}.promoter.tsv"),
+    params:
+        expand_len = 1000,
+    shell: 
+        """
+source activate py35
+bed_profile reference-point --referencePoint TSS -i {input.peak} --ref {input.gene} -o {output.res} --upstream {params.expand_len} --downstream {params.expand_len}
+        """
+
+rule ATAC_profile:
+    input:
+        expand(rules.ATAC_promoter_profile.output, sample=["WT", "FL"]),
+        expand(rules.ATAC_peak_promoter_profile.output, sample=["WT", "FL"]),
+
+rule ATAC_peak_location:
+    input:
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+        ref = REF_BED,
+        chrom_size = CHROM_SIZE,
+    output:
+        loc_stat = os.path.join("analysis_v3", "ATAC", "peak_profile", "peak.location.tsv"),
+    params:
+        class_peak_pos = "python scripts/ATAC/class_peak_pos.py",
+    shell:
+        """
+source activate py35
+{params.class_peak_pos} -i {input.peak} -r {input.ref} -s {input.chrom_size} -o {output.loc_stat}
+        """
+
+rule ATAC_with_CpG:
+    input:
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+        CpG = CPG_ISLAND,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "CpG", "peak.CpG.bed"),
+    shell:
+        """
+bedtools intersect -wa -a {input.peak} -b {input.CpG} > {output.res}
+        """
+
+rule ATAC_MACS2_peak2gene_tsv:
+    input:
+        peak = rules.merge_ATAC_MACS2_peak.output.peak,
+        ref = "analysis/novel_ann/taco_noval_gene/merge.iso.bed6"
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "MACS2_peak2gene", "ATAC.peak2gene.tsv"),
+    params:
+        peak2gene_tsv = "python scripts/processing_atac/peak2gene_tsv.py",
+    shell:
+        """
+source activate py35
+{params.peak2gene_tsv} -i {input.peak} -r {input.ref} -o {output.res}
+        """
+
+rule cnt_kmer_motif_MACS2:
+    input:
+        peak = rules.merge_ATAC_MACS2_peak.output.peak,
+        genome = GENOME_FA,
+    output:
+        cnt = os.path.join("analysis_v3", "ATAC", "kmer_motif_cnt_MACS2", "kmer.{kmer}.cnt.tsv"),
+    params:
+        cnt_kmer_motif = "python scripts/processing_atac/cnt_kmer_motif.py",
+    shell:
+        """
+source activate py35
+mpiexec -n 60 {params.cnt_kmer_motif} --peak {input.peak} --genome {input.genome} -k {wildcards.kmer} -o {output.cnt}
+        """
+
+rule kmer_motif2gene_cnt_MACS2:
+    input:
+        cnt = rules.cnt_kmer_motif_MACS2.output.cnt,
+        peak2gene = rules.ATAC_MACS2_peak2gene_tsv.output.res,
+    output:
+        cnt = os.path.join("analysis_v3", "ATAC", "kmer_motif_cnt_MACS2", "kmer.{kmer}.cnt.gene.tsv"),
+    params:
+        kmer_motif2gene_cnt = "python scripts/processing_atac/kmer_motif2gene_cnt.py",
+    shell:
+        """
+source activate py35
+mpiexec -n 60 {params.kmer_motif2gene_cnt} -i {input.cnt} --peak2gene {input.peak2gene} -o {output.cnt}
+        """
+
+rule run_cnt_kmer_motif_MACS2:
+    input:
+        expand(rules.kmer_motif2gene_cnt_MACS2.output, kmer = [8])
+
+rule cnt_ATAC_MACS2_UMI:
+    input:
+        bam = rules.filter_ATAC_bam.output.bam,
+        peak = rules.merge_ATAC_MACS2_peak.output.peak,
+    output:
+        cnt = os.path.join("analysis_v3", "ATAC", "MACS2_cnt", "{sample}.peak.cnt.tsv"),
+    params:
+        compute_ATAC_UMI = "python scripts/processing_atac/compute_ATAC_UMI.py",
+    shell:
+        """
+source activate py35
+mpiexec -n 60 {params.compute_ATAC_UMI} -i {input.bam} -o {output.cnt} --peak {input.peak}
+        """
+
+rule ATAC_MACS2_peak2gene:
+    input:
+        cnt = rules.cnt_ATAC_MACS2_UMI.output.cnt,
+        ref = "analysis/novel_ann/taco_noval_gene/merge.iso.bed6"
+    output:
+        cnt = os.path.join("analysis_v3", "ATAC", "MACS2_cnt", "{sample}.gene.cnt.tsv"),
+    params:
+        peak_mat2gene = "python scripts/processing_atac/peak_mat2gene.py",
+    shell:
+        """
+source activate py35
+mpiexec -n 60 {params.peak_mat2gene} -i {input.cnt} -r {input.ref} -o {output.cnt}
+        """
+
+rule run_ATAC_MACS2_peak2gene:
+    input:
+        expand(rules.ATAC_MACS2_peak2gene.output, sample=["WT", "FL"])
+
+rule fetch_ATAC_MACS2:
+    input:
+        peak = rules.merge_ATAC_MACS2_peak.output.peak,
+        genome = GENOME_2bit,
+        sizes = CHROM_SIZE,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "data", "ATAC.MACS2.bed6"),
+        fa = os.path.join("analysis_v3", "ATAC", "data", "ATAC.MACS2.fa"),
+    shell:
+        """
+cat {input.peak} | awk '{{FS=OFS="\t"}}{{ print $1, $2, $3, $1"_"$2"_"$3, 0, "." }}' > {output.bed}
+twoBitToFa -bed={output.bed} {input.genome} {output.fa}
+        """
+
+
+rule planttfdb_ATAC_binding_site_MACS2:
+    input:
+        ATAC_fa = rules.fetch_ATAC_MACS2.output.fa,
+        meme = lambda wildcards: os.path.join(TF_MOTIF_BASE[wildcards.source], "{name}.meme")
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "binding_site_MACS2", "{source}", "{name}", "mast.xml")
+    params:
+        job_name = "plantTFDB_ATAC_binding_site",
+        walltime = "480:00:00",
+        nodes = "nodes=1:ppn=1",
+        log = "log",
+        queue = "All",
+        output_folder = os.path.join("analysis_v3", "ATAC", "binding_site_MACS2", "{source}", "{name}"),
+    priority: 100
+    shell:
+        "mast --oc {params.output_folder} {input.meme} {input.ATAC_fa}"
+
+
+rule summary_ATAC_tf_binding_site_MACS2:
+    input:
+        res_li = lambda wildcards: [rules.planttfdb_ATAC_binding_site_MACS2.output.res.format(source=wildcards.source, name=name) for name in PLANTTFDB_MEME[wildcards.source]],
+        ref = REF_GENE_BED,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "binding_site_MACS2", "{source}", "merge.tsv"),
+    params:
+        expand = 1000,
+    run:
+        from pybicl.io import Xml, BedFile
+        from pybicl.operation import IvalTree
+        from pybicl.parser.xml import XmlBs4
+        ref_bed = BedFile(input.ref, "r")
+        ref_ival = IvalTree(False)
+        for rec in ref_bed.load():
+            ref_ival.add(rec.name, rec.chrom, rec.chromStart-params.expand, rec.chromEnd+params.expand, None)
+        with open(output.res, "w") as f:
+            header = "TF\tATAC_peak\tGid\tpvalue\tevalue\n"
+            f.write(header)
+            for tf in PLANTTFDB_MEME[wildcards.source]:
+                xml = Xml(rules.planttfdb_ATAC_binding_site_MACS2.output.res.format(name=tf, source=wildcards.source), "r")
+                root = xml.load(XmlBs4)
+                for hit in root.data.find_all("sequence"):
+                    target_peak = hit.attrs["name"]
+                    peak_info = target_peak.split("_")
+                    end = peak_info[-1]
+                    start = peak_info[-2]
+                    chrom = "_".join(peak_info[:-2])
+                    overlap_genes = ref_ival.find(chrom, int(start), int(end), None)
+                    if overlap_genes:
+                        Gids=",".join(overlap_genes)
+                    else:
+                        Gids="NA"
+                    score = hit.find("score")
+                    pval = score.attrs["combined_pvalue"]
+                    eval = score.attrs["evalue"]
+                    f.write("\t".join([tf, target_peak, Gids, pval, eval])+"\n")
+
+rule run_summary_ATAC_tf_binding_site_MACS2:
+    input:
+        expand(rules.summary_ATAC_tf_binding_site_MACS2.output, source=PLANTTFDB_MEME.keys())
+
+
+rule fetch_ATAC_peak_DE_seq_MACS2:
+    input:
+        DE_peak = ATAC_PEAK_DE_MACS2,
+        genome = GENOME_2bit,
+        sizes = CHROM_SIZE,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "data_MACS2", "ATAC.DE.{sample}.bed6"),
+        fa = os.path.join("analysis_v3", "ATAC", "data_MACS2", "ATAC.DE.{sample}.fa"),
+    shell:
+        """
+cat {input.DE_peak} | awk '{{FS=OFS="\t"}}{{ if($8=="{wildcards.sample}"){{ print $1, $2, $3, $1"_"$2"_"$3, 0, "." }} }}' > {output.bed}
+twoBitToFa -bed={output.bed} {input.genome} {output.fa}
+        """
+
+rule fetch_ATAC_peak_weakDE_seq_MACS2:
+    input:
+        DE_peak = ATAC_PEAK_WEAK_DE_MACS2,
+        genome = GENOME_2bit,
+        sizes = CHROM_SIZE,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "data", "ATAC.weakDE.{sample}.bed6"),
+        fa = os.path.join("analysis_v3", "ATAC", "data", "ATAC.weakDE.{sample}.fa"),
+    shell:
+        """
+cat {input.DE_peak} | awk '{{FS=OFS="\t"}}{{ if($8=="{wildcards.sample}"){{ print $1, $2, $3, $1"_"$2"_"$3, 0, "." }} }}' > {output.bed}
+twoBitToFa -bed={output.bed} {input.genome} {output.fa}
+        """
+        
+rule fetch_ATAC_peak_bothDE_seq_MACS2:
+    input:
+        DE_peak = ATAC_PEAK_DE_MACS2,
+        weakDE_peak = ATAC_PEAK_WEAK_DE_MACS2,
+        genome = GENOME_2bit,
+        sizes = CHROM_SIZE,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "data", "ATAC.bothDE.{sample}.bed6"),
+        fa = os.path.join("analysis_v3", "ATAC", "data", "ATAC.bothDE.{sample}.fa"),
+    shell:
+        """
+cat {input.DE_peak} {input.weakDE_peak} | awk '{{FS=OFS="\t"}}{{ if($8=="{wildcards.sample}"){{ print $1, $2, $3, $1"_"$2"_"$3, 0, "." }} }}' > {output.bed}
+twoBitToFa -bed={output.bed} {input.genome} {output.fa}
+        """
+
+rule ATAC_peak_weakDE_homer_MACS2:
+    input:
+        DE_peak = rules.fetch_ATAC_peak_weakDE_seq_MACS2.output.bed,
+        de_peak_fa = rules.fetch_ATAC_peak_weakDE_seq_MACS2.output.fa,
+        genome = GENOME_FA,
+    output:
+        motif = touch(os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2", "ATAC.weakDE.{sample}.out", "done.flag")),
+    params:
+        out_dir = os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2", "ATAC.weakDE.{sample}.out")
+    shell:
+        """
+findMotifsGenome.pl {input.DE_peak} {input.genome} {params.out_dir}
+        """
+
+rule ATAC_peak_weakDE_homer_MACS2_bg:
+    input:
+        DE_peak = rules.fetch_ATAC_peak_weakDE_seq_MACS2.output.bed,
+        All_peak = rules.merge_ATAC_MACS2_peak.output.peak,
+        de_peak_fa = rules.fetch_ATAC_peak_weakDE_seq_MACS2.output.fa,
+        genome = GENOME_FA,
+    output:
+        motif = touch(os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2_bg", "ATAC.weakDE.{sample}.out", "done.flag")),
+    params:
+        out_dir = os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2_bg", "ATAC.weakDE.{sample}.out")
+    shell:
+        """
+findMotifsGenome.pl {input.DE_peak} {input.genome} {params.out_dir} -bg {input.All_peak}
+        """
+
+rule ATAC_peak_bothDE_homer_MACS2:
+    input:
+        DE_peak = rules.fetch_ATAC_peak_bothDE_seq_MACS2.output.bed,
+        de_peak_fa = rules.fetch_ATAC_peak_bothDE_seq_MACS2.output.fa,
+        genome = GENOME_FA,
+    output:
+        motif = touch(os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2", "ATAC.bothDE.{sample}.out", "done.flag")),
+    params:
+        out_dir = os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2", "ATAC.bothDE.{sample}.out")
+    shell:
+        """
+findMotifsGenome.pl {input.DE_peak} {input.genome} {params.out_dir}
+        """
+
+rule ATAC_peak_bothDE_homer_MACS2_bg:
+    input:
+        DE_peak = rules.fetch_ATAC_peak_bothDE_seq_MACS2.output.bed,
+        All_peak = rules.merge_ATAC_MACS2_peak.output.peak,
+        de_peak_fa = rules.fetch_ATAC_peak_bothDE_seq_MACS2.output.fa,
+        genome = GENOME_FA,
+    output:
+        motif = touch(os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2_bg", "ATAC.bothDE.{sample}.out", "done.flag")),
+    params:
+        out_dir = os.path.join("analysis_v3", "ATAC", "DE_homer_MACS2_bg", "ATAC.bothDE.{sample}.out")
+    shell:
+        """
+findMotifsGenome.pl {input.DE_peak} {input.genome} {params.out_dir} -bg {input.All_peak}
+        """
+
+
+rule ATAC_gene_DE_GO_MACS2:
+    input:
+        DE = ATAC_GENE_DE_MACS2,
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "gene_DE_topGO_MACS2", "topGO.flag"))
+    params:
+        work_dir = os.path.join("analysis_v3", "ATAC", "gene_DE_topGO_MACS2"),
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+    shell:
+        """
+if [[ -e {params.work_dir} ]]; then
+    rm -r {params.work_dir}
+fi
+mkdir -p {params.work_dir}/WT
+mkdir -p {params.work_dir}/FL
+
+cat {input} | awk '{{ FS=OFS="\t" }}{{ if($6=="WT"){{ print $1 }} }}' > {params.work_dir}/WT.gene.txt
+cat {input} | awk '{{ FS=OFS="\t" }}{{ if($6=="FL"){{ print $1 }} }}' > {params.work_dir}/FL.gene.txt
+{params.run_topgo} --gene-list {params.work_dir}/WT.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}/WT
+{params.run_topgo} --gene-list {params.work_dir}/FL.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}/FL
+        """
+
+rule stat_kmer_motif_position:
+    input:
+        motif = os.path.join("analysis_v3", "ATAC", "kmer_cluster", "kmer.8.graph_enrich.umi.cluster.txt"),
+        genome = GENOME_FA,
+        ref_gene = REF_GENE_BED,
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+    output:
+        stat = os.path.join("analysis_v3", "ATAC", "kmer_cluster", "kmer.8.graph_enrich.cluster.motif_pos.tsv"),
+    params:
+        up_expand = 1000,
+        down_expand = 500,
+        stat_kmer_motif_position = "python scripts/processing_atac/stat_kmer_motif_position.py"
+    shell:
+        """
+source activate py35
+{params.stat_kmer_motif_position} -r {input.ref_gene} -g {input.genome} -p {input.peak} -m {input.motif} -o {output.stat} --upstream-expand {params.up_expand} --downstream-expand {params.down_expand}
+        """
+
+rule stat_peak_position:
+    input:
+        genome = GENOME_FA,
+        ref_gene = REF_GENE_BED,
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+    output:
+        stat = os.path.join("analysis_v3", "ATAC", "kmer_cluster", "peak_pos.tsv"),
+    params:
+        up_expand = 1000,
+        down_expand = 500,
+        stat_peak_position = "python scripts/processing_atac/stat_peak_position.py"
+    shell:
+        """
+source activate py35
+{params.stat_peak_position} -r {input.ref_gene} -g {input.genome} -p {input.peak} -o {output.stat} --upstream-expand {params.up_expand} --downstream-expand {params.down_expand}
+        """
+
+rule plot_ATAC_track:
+    input:
+        peak = rules.ATAC_MACS2_peak2fa.output.bed,
+        ref_gene = REF_GENE_BED,
+        ref_bed12 = REF_BED,
+        WT_bw= os.path.join("analysis_v3", "ATAC", "bw", "WT.bw"),
+        FL_bw= os.path.join("analysis_v3", "ATAC", "bw", "FL.bw"),
+        TCP_motif = os.path.join("analysis_v3", "ATAC", "motif", "TCP_motif", "TCP_motif.bed"),
+        TCP_like_motif = os.path.join("analysis_v3", "ATAC", "motif", "TCP_like_motif", "TCP_like_motif.bed"),
+        Gbox_like_motif = os.path.join("analysis_v3", "ATAC", "motif", "Gbox_motif", "Gbox_motif.bed"),
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "track", "done.flag")),
+    params:
+        plot_tracks = "Rscript scripts/utils/plot_tracks.R",
+        outdir = os.path.join("analysis_v3", "ATAC", "track"),
+        expand = 1000,
+    shell:
+        """
+{params.plot_tracks} --bw {input.WT_bw} {input.FL_bw} --bw-label "WT ATAC" "FL ATAC" --bw-color red blue --ref-bed12 {input.ref_bed12} --ref-bed12-label Gene --ref-bed12-color black --ref-bed6 {input.peak} {input.TCP_motif} {input.TCP_like_motif} {input.Gbox_like_motif} --ref-bed6-label "ATAC peak" TCP TCP_like Gbox --ref-bed6-color black black black black --loc-bed {input.ref_gene} --expand-len {params.expand} -o {params.outdir}
+         """
+
+rule fetch_TCP_motif:
+    input:
+        genome2bit = GENOME_2bit,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "TCP_motif", "TCP_motif.bed"),
+    shell:
+        """
+findMotif -motif=TGGGCT {input.genome2bit} > {output.res}
+findMotif -motif=TGGGCC {input.genome2bit} >> {output.res}
+        """
+
+rule TCP_motif_neaberby_promoter:
+    input:
+        motif = rules.fetch_TCP_motif.output.res,
+        gene = REF_GENE_BED,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "TCP_motif", "TCP_motif.promoter.bed"),
+    params:
+        expand = 100,
+    shell:
+        """
+cat {input.gene} | awk '{{FS=OFS="\t"}}{{ if($6=="+"){{tss=$2}}else{{tss=$3-1}}; start_site=tss-{params.expand}; if(start_site<0){{start_site=0}}; print $1, start_site, tss+1+{params.expand}, $4, $5, $6 }}' | sort -k 1,1 -k 2,2n > {output.stat}.promoter.bed
+bedtools intersect -wb -a {input.motif} -b {output.stat}.promoter.bed | awk '{{FS=OFS="\t"}}{{print $1, $2, $3, $10, 0,$6}}' | sort > {output.bed}
+rm {output.stat}.promoter.bed
+        """
+
+rule TCP_motif_neaberby_promoter_ATAC:
+    input:
+        motif = rules.TCP_motif_neaberby_promoter.output.bed,
+        ATAC_peak = rules.ATAC_MACS2_peak2fa.output.bed,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "TCP_motif", "TCP_motif.promoter.ATAC.bed"),
+    params:
+        expand = 100,
+    shell:
+        """
+bedtools intersect -wb -a {input.motif} -b {input.ATAC_peak} | awk '{{FS=OFS="\t"}}{{print $1, $2, $3, $4, 0,$6}}' | sort >> {output.bed}
+        """
+
+rule TCP_GO:
+    input:
+        TCP = os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "TCP", "TCP.gene.tsv"),
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "TCP", "topGO", "TCP.flag")),
+    params:
+        work_dir = os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "TCP", "topGO"),
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+    shell:
+        """
+if [[ -e {params.work_dir} ]]; then
+    rm -r {params.work_dir}
+fi
+mkdir {params.work_dir}
+cat {input.TCP} | cut -f 1 | sed 1d > {params.work_dir}/TCP.gene.txt
+{params.run_topgo} --gene-list {params.work_dir}/TCP.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}
+        """
+
+rule ACCCT_motif_GO:
+    input:
+        TCP = os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "ACCCT_motif", "ACCCT_motif.gene.tsv"),
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "ACCCT_motif", "topGO", "ACCCT_motif.flag")),
+    params:
+        work_dir = os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "ACCCT_motif", "topGO"),
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+    shell:
+        """
+if [[ -e {params.work_dir} ]]; then
+    rm -r {params.work_dir}
+fi
+mkdir {params.work_dir}
+cat {input.TCP} | cut -f 1 | sed 1d > {params.work_dir}/TCP.gene.txt
+{params.run_topgo} --gene-list {params.work_dir}/TCP.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}
+        """
+
+rule TCP_like_motif_GO:
+    input:
+        TCP = os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "TCP_like_motif", "TCP_like_motif.gene.tsv"),
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "TCP_like_motif", "topGO", "TCP_like_motif.flag")),
+    params:
+        work_dir = os.path.join("analysis_v3", "ATAC", "ATAC_kmer_cluster2gene", "TCP_like_motif", "topGO"),
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+    shell:
+        """
+if [[ -e {params.work_dir} ]]; then
+    rm -r {params.work_dir}
+fi
+mkdir {params.work_dir}
+cat {input.TCP} | cut -f 1 | sed 1d > {params.work_dir}/TCP.gene.txt
+{params.run_topgo} --gene-list {params.work_dir}/TCP.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}
+        """
+
+rule ATAC_WT_DE_peak_GO:
+    input:
+        WT_DE_peak = os.path.join("analysis_v3", "ATAC", "ATAC_DE_peak2C3", "ATAC_DE_peak_target_gene.expr_gene.CPM.SourceData.tsv"),
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "ATAC_DE_peak2C3", "topGO", "ATAC_DE_peak.flag")),
+    params:
+        work_dir = os.path.join("analysis_v3", "ATAC", "ATAC_DE_peak2C3", "topGO"),
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+    shell:
+        """
+if [[ -e {params.work_dir} ]]; then
+    rm -r {params.work_dir}
+fi
+mkdir {params.work_dir}
+cat {input.WT_DE_peak} | cut -f 1 | sed 1d | sort -u > {params.work_dir}/ATAC_DE_peak.gene.txt
+{params.run_topgo} --gene-list {params.work_dir}/ATAC_DE_peak.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}
+        """
+
+MYB_G4 = ["CT", "A", "C", "C", "AT", "A", "C", "AC", "CT"]
+
+
+MOTIF_LI = {
+    "AP2": ["ACCGAC"],
+    "MYB_WT": ["TACCTAAC"],
+    "MYB_G4": ["CACCAACAC", "TACCAACAC", "CACCTACAC", "TACCTACAC", "CACCAACCC", "TACCAACCC", "CACCTACCC", "TACCTACCC", 
+    "CACCAACAT", "TACCAACAT", "CACCTACAT", "TACCTACAT", "CACCAACCT", "TACCAACCT", "CACCTACCT", "TACCTACCT"],
+    "Gbox": ["CACGTG"],
+    "TCP": ["TGGGCT", "TGGGCC"],
+    "TCP_like": ["TAGGGT"],
+    "WRKY": ["TTGACT", "TTGACC"]
+}
+
+rule fetch_motif:
+    input:
+        genome2bit = GENOME_2bit,
+    output:
+        res = os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "{motif}_motif.bed"),
+    params:
+        motif = lambda wildcards: MOTIF_LI[wildcards.motif]
+    run:
+        cmd = """
+if [[ -e {output.res}.tmp ]]; then
+    rm {output.res}.tmp
+fi
+        """
+        shell(cmd)
+        for motif in params.motif:
+            cmd = "findMotif -motif={motif} {genome} >> {res}.tmp".format(motif=motif, genome=input.genome2bit, res=output.res)
+            shell(cmd)
+        cmd = """
+cat {output.res}.tmp | sort -k 1,1 -k 2,2n > {output.res}
+rm {output.res}.tmp
+        """
+        shell(cmd)
+
+
+rule motif_neaberby_ATAC:
+    input:
+        motif = rules.fetch_motif.output.res,
+        ATAC_peak = rules.ATAC_MACS2_peak2fa.output.bed,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "{motif}_motif.ATAC.bed"),
+    params:
+        expand = 100,
+    shell:
+        """
+bedtools intersect -wb -a {input.motif} -b {input.ATAC_peak} | awk '{{FS=OFS="\t"}}{{print $1, $2, $3, $4, 0, $6}}' | sort -k 1,1 -k 2,2n > {output.bed}
+        """
+
+rule motif_neaberby_promoter:
+    input:
+        motif = rules.fetch_motif.output.res,
+        gene = REF_GENE_BED,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "{motif}_motif.promoter.bed"),
+    params:
+        expand = 1000,
+    shell:
+        """
+cat {input.gene} | awk '{{FS=OFS="\t"}}{{ if($6=="+"){{tss=$2}}else{{tss=$3-1}}; start_site=tss-{params.expand}; if(start_site<0){{start_site=0}}; print $1, start_site, tss+1+{params.expand}, $4, $5, $6 }}' | sort -k 1,1 -k 2,2n > {output.bed}.promoter.bed
+bedtools intersect -wb -a {input.motif} -b {output.bed}.promoter.bed | awk '{{FS=OFS="\t"}}{{print $1, $2, $3, $10, 0,$6}}' | sort > {output.bed}
+rm {output.bed}.promoter.bed
+        """
+
+rule motif_neaberby_promoter_ATAC:
+    input:
+        motif = rules.motif_neaberby_promoter.output.bed,
+        ATAC_peak = rules.ATAC_MACS2_peak2fa.output.bed,
+    output:
+        bed = os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "{motif}_motif.promoter.ATAC.bed"),
+    shell:
+        """
+bedtools intersect -wb -a {input.motif} -b {input.ATAC_peak} | awk '{{FS=OFS="\t"}}{{print $1, $2, $3, $4, 0,$6}}' | sort >> {output.bed}
+        """
+
+rule motif_topGO:
+    input:
+        motif = rules.motif_neaberby_promoter_ATAC.output.bed,
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "topGO", "{motif}.flag")),
+    params:
+        work_dir = os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "topGO"),
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+    shell:
+        """
+if [[ -e {params.work_dir} ]]; then
+    rm -r {params.work_dir}
+fi
+mkdir {params.work_dir}
+cat {input.motif} | cut -f 4 | sort -u > {params.work_dir}/motif.gene.txt
+{params.run_topgo} --gene-list {params.work_dir}/motif.gene.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes 20 --output {params.work_dir}
+        """
+
+rule plot_motif_topGO:
+    input:
+        flag = expand(rules.motif_topGO.output, motif=MOTIF_LI.keys()),
+    output:
+        plot = os.path.join("analysis_v3", "ATAC", "motif", "summary", "topGO.pdf"),
+    params:
+        plot_term = "Rscript scripts/RNA_seq/plot_group_gene_term.R",
+        file = [os.path.join("analysis_v3", "ATAC", "motif", "{motif}_motif", "topGO", "topGO.tsv").format(motif=motif) for motif in sorted(MOTIF_LI)],
+        motif = sorted(MOTIF_LI)
+    shell:
+        """
+{params.plot_term} -i {params.file} --label {params.motif} -o {output.plot}
+        """
+
+rule motif_screening:
+    input:
+        expand(rules.motif_neaberby_ATAC.output, motif=MOTIF_LI.keys()),
+

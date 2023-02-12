@@ -1,0 +1,282 @@
+import os
+curDir = os.getcwd()
+include: "MetaInfo.sm.rules"
+
+RNA_SEQ_BASE = os.path.join("analysis", "RNA_seq")
+rule rm_adaptor:
+    input:
+        R1 = os.path.join(OVULE_RNA_SEQ_BASE, "{tp}", "{SRR}_1.fastq.gz"),
+        R2 = os.path.join(OVULE_RNA_SEQ_BASE, "{tp}", "{SRR}_2.fastq.gz"),
+    output:
+        R1 = os.path.join(RNA_SEQ_BASE, "trim", "{tp}", "{SRR}_R1.fastq.gz"),
+        R2 = os.path.join(RNA_SEQ_BASE, "trim", "{tp}", "{SRR}_R2.fastq.gz"),
+    shell:
+        """
+cutadapt -a AGATCGGAAGAGC -A AGATCGGAAGAGC -m 40 -o {output.R1} -p {output.R2} {input.R1} {input.R2}
+        """
+
+rule RNA_seq_mapping:
+    input:
+        trimed_R1 = rules.rm_adaptor.output.R1,
+        trimed_R2 = rules.rm_adaptor.output.R2,
+        gtf = REF_GTF,
+    output:
+        bam = os.path.join(RNA_SEQ_BASE, "bam", "{tp}", "{SRR}.sort.bam"),
+    params:
+        star_rRNA_indx = STAR_INDEX_RRNA,
+        star_indx = STAR_INDX,
+        mapping_dir = os.path.join(RNA_SEQ_BASE, "bam", "{tp}", "{SRR}"),
+    shell:
+        r"""
+export LANG=en_EN
+if [[ -e {params.mapping_dir}_rRNA ]]; then
+    rm -rf {params.mapping_dir}_rRNA
+fi
+mkdir -p {params.mapping_dir}_rRNA
+STAR --runMode alignReads --runThreadN 28 --genomeDir {params.star_rRNA_indx} \
+    --sjdbOverhang 140 --outSAMmultNmax 1 --alignEndsType Local \
+    --readFilesIn {input.trimed_R1} {input.trimed_R2} \
+    --outFileNamePrefix {params.mapping_dir}_rRNA/ \
+    --outReadsUnmapped Fastx --readFilesCommand gunzip -c
+
+### Sort fastq code was from "https://www.biostars.org/p/59707/"
+mkfifo {params.mapping_dir}_rRNA/tmp
+awk 'NR%4==1{{n=$1}}NR%4==2{{s=$1}}NR%4==0{{print n,s,$1}}' {params.mapping_dir}_rRNA/Unmapped.out.mate1 | sort -S 2G > {params.mapping_dir}_rRNA/tmp &
+awk 'NR%4==1{{n=$1}}NR%4==2{{s=$1}}NR%4==0{{print n,s,$1}}' {params.mapping_dir}_rRNA/Unmapped.out.mate2 | sort -S 2G | join -a1 -a2 {params.mapping_dir}_rRNA/tmp - | awk 'NF==5{{print $1"\n"$2"\n+\n"$3 >"{params.mapping_dir}_rRNA/R1.fq";print $1"\n"$4"\n+\n"$5 >"{params.mapping_dir}_rRNA/R2.fq"}}NF==3{{print $1"\n"$2"\n+\n"$3>"{params.mapping_dir}_rRNA/orphan.fq"}}'
+rm {params.mapping_dir}_rRNA/tmp
+
+if [[ -e {params.mapping_dir} ]]; then
+    rm -rf {params.mapping_dir}
+fi
+mkdir -p {params.mapping_dir}
+STAR --runMode alignReads --runThreadN 28 --genomeDir {params.star_indx} \
+--sjdbGTFfile {input.gtf} --sjdbOverhang 140 --outFilterMultimapNmax 5 --outSAMmultNmax 1 --alignEndsType Local \
+--outFilterMatchNminOverLread 0.4 --outFilterScoreMinOverLread 0.4 --alignIntronMax 100000 --alignMatesGapMax 100000 \
+--readFilesIn {params.mapping_dir}_rRNA/R1.fq {params.mapping_dir}_rRNA/R2.fq \
+--outFileNamePrefix {params.mapping_dir}/ --outReadsUnmapped Fastx
+samtools view -@ 28 -q 20 -bS {params.mapping_dir}/Aligned.out.sam > {params.mapping_dir}/Aligned.out.bam
+samtools sort -@ 28 {params.mapping_dir}/Aligned.out.bam -o {output.bam}
+samtools index {output.bam}
+rm {params.mapping_dir}/Aligned.out.sam {params.mapping_dir}/Aligned.out.bam &
+rm -r {params.mapping_dir}_rRNA
+        """
+
+rule rna_seq_bam2bw:
+    input:
+        bam = rules.RNA_seq_mapping.output.bam,
+        merge_bed = REF_GENE_BED,
+        size = CHROM_SIZE,
+    output:
+        flag = touch(os.path.join(RNA_SEQ_BASE, "bw", "{tp}.{SRR}.flag")),
+    params:
+        total_sum = 1000000000,
+        work_dir = os.path.join(RNA_SEQ_BASE, "bw", "{tp}.{SRR}"),
+    shell:
+        """
+
+rule_text=$(infer_experiment.py -i {input.bam} -r {input.merge_bed} | grep -e "[+-]")
+
+indx=0
+for word in ${{rule_text[@]}}; do
+    let "indx = indx + 1"
+    if [[ ${{indx}} = 6 ]]; then
+        rule1=${{word:1:-2}}
+    elif [[ ${{indx}} = 7 ]]; then
+        score1=${{word}}
+    elif [[ ${{indx}} = 13 ]]; then
+        rule2=${{word:1:-2}}
+    elif [[ ${{indx}} = 14 ]]; then
+        score2=${{word}}
+    fi
+done
+
+if [[ `awk "BEGIN{{print(${{score1}}>${{score2}})?"1":"0"}}"` = 1 ]]; then
+    rule=${{rule1}}
+    score=${{score1}}
+    unrule_score=${{score2}}
+else
+    rule=${{rule2}}
+    score=${{score2}}
+    unrule_score=${{score1}}
+fi
+
+echo "file: {input.bam}  rule: ${{rule}}  score: ${{score}}"
+if [[ `awk "BEGIN{{print(${{score}}-${{unrule_score}}>0.3)?"1":"0"}}"` = 0 ]]; then
+    mode=1
+else
+    mode=2
+fi
+
+if [[ ${{mode}} = 1 ]]; then
+    bam2wig.py -t {params.total_sum} -s {input.size} -i {input.bam} -o {params.work_dir}
+    wigToBigWig -clip {params.work_dir}.wig {input.size} {params.work_dir}.bw
+    rm {params.work_dir}.wig
+else
+    bam2wig.py -t {params.total_sum} -s {input.size} -i {input.bam} -o {params.work_dir} -d "${{rule}}"
+    wigToBigWig -clip {params.work_dir}.Forward.wig {input.size} {params.work_dir}.Forward.bw
+    wigToBigWig -clip {params.work_dir}.Reverse.wig {input.size} {params.work_dir}.Reverse.bw
+    rm {params.work_dir}.Forward.wig {params.work_dir}.Reverse.wig
+fi
+        """
+
+rule rna_seq_stringtie:
+    input:
+        bam = rules.RNA_seq_mapping.output.bam,
+        merge_bed = REF_GENE_BED,
+        gtf = REF_GTF,
+    output:
+        gtf = os.path.join(RNA_SEQ_BASE, "stringtie", "{tp}.{SRR}.gtf"),
+        tab = os.path.join(RNA_SEQ_BASE, "stringtie", "{tp}.{SRR}.tab"),
+    shell:
+        """
+rule_text=$(infer_experiment.py -i {input.bam} -r {input.merge_bed} | grep -e "[+-]")
+
+indx=0
+for word in ${{rule_text[@]}}; do
+    let "indx = indx + 1"
+    if [[ ${{indx}} = 6 ]]; then
+        rule1=${{word:1:-2}}
+    elif [[ ${{indx}} = 7 ]]; then
+        score1=${{word}}
+    elif [[ ${{indx}} = 13 ]]; then
+        rule2=${{word:1:-2}}
+    elif [[ ${{indx}} = 14 ]]; then
+        score2=${{word}}
+    fi
+done
+
+if [[ `awk "BEGIN{{print(${{score1}}>${{score2}})?"1":"0"}}"` = 1 ]]; then
+    rule=${{rule1}}
+    score=${{score1}}
+    unrule_score=${{score2}}
+else
+    rule=${{rule2}}
+    score=${{score2}}
+    unrule_score=${{score1}}
+fi
+
+echo "file: {input.bam}  rule: ${{rule}}  score: ${{score}}"
+if [[ `awk "BEGIN{{print(${{score}}-${{unrule_score}}>0.3)?"1":"0"}}"` = 0 ]]; then
+    mode=1
+else
+    mode=2
+fi
+
+if [[ ${{mode}} = 1 ]]; then
+    rule_parm=""
+else
+    if [[ ${{rule}} = "++,--" || ${{rule}} == "1++,1--,2+-,2-+" ]]; then
+        rule_parm="--rf"
+    else
+        rule_parm="--fr"
+    fi
+fi
+
+stringtie -p 4 ${{rule_parm}} -e -G {input.gtf} -A {output.tab} -o {output.gtf} {input.bam}
+        """
+
+rule merge_stringtie_fpkm:
+    input:
+        [rules.rna_seq_stringtie.output.gtf.format(tp=tp, SRR=SRR) for tp in OVULE_RNA_SEQ_DATA.keys() for SRR in OVULE_RNA_SEQ_DATA[tp]],
+    output:
+        sample_data = os.path.join(RNA_SEQ_BASE, "merge_expr", "sample.FPKM.tsv"),
+        tp_data = os.path.join(RNA_SEQ_BASE, "merge_expr", "TP.FPKM.tsv"),
+        cor_plot = os.path.join(RNA_SEQ_BASE, "merge_expr", "sample.cor.pdf"),
+    params:
+        merge_stringtie_fpkm = "Rscript scripts/stat/merge_stringtie_fpkm.R",
+    run:
+        TPs = ["m3DPA", "m1DPA", "0DPA", "1DPA", "3DPA", "5DPA"]
+        srr_li = list()
+        tp_li = list()
+        file_li = list()
+        for tp in TPs:
+            for srr in OVULE_RNA_SEQ_DATA[tp]:
+                tp_li.append(tp)
+                srr_li.append(srr)
+                file_li.append(rules.rna_seq_stringtie.output.tab.format(tp=tp, SRR=srr))
+        cmd = "{merge_stringtie_fpkm} -i {files} -t {tps} -s {SRRs} --out-data {sample_data} --out-plot {cor_plot} --out-merge {tp_data}".format(
+            files=" ".join(file_li), tps=" ".join(tp_li), SRRs=" ".join(srr_li), **output, **params
+        )
+        shell(cmd)
+
+TACO_GTF = os.path.join("analysis", "novel_ann", "taco_noval_gene", "merge.iso.gtf")
+
+rule taco_rna_seq_stringtie:
+    input:
+        bam = rules.RNA_seq_mapping.output.bam,
+        merge_bed = REF_GENE_BED,
+        gtf = TACO_GTF,
+    output:
+        gtf = os.path.join(RNA_SEQ_BASE, "taco_stringtie", "{tp}.{SRR}.gtf"),
+        tab = os.path.join(RNA_SEQ_BASE, "taco_stringtie", "{tp}.{SRR}.tab"),
+    shell:
+        """
+rule_text=$(infer_experiment.py -i {input.bam} -r {input.merge_bed} | grep -e "[+-]")
+
+indx=0
+for word in ${{rule_text[@]}}; do
+    let "indx = indx + 1"
+    if [[ ${{indx}} = 6 ]]; then
+        rule1=${{word:1:-2}}
+    elif [[ ${{indx}} = 7 ]]; then
+        score1=${{word}}
+    elif [[ ${{indx}} = 13 ]]; then
+        rule2=${{word:1:-2}}
+    elif [[ ${{indx}} = 14 ]]; then
+        score2=${{word}}
+    fi
+done
+
+if [[ `awk "BEGIN{{print(${{score1}}>${{score2}})?"1":"0"}}"` = 1 ]]; then
+    rule=${{rule1}}
+    score=${{score1}}
+    unrule_score=${{score2}}
+else
+    rule=${{rule2}}
+    score=${{score2}}
+    unrule_score=${{score1}}
+fi
+
+echo "file: {input.bam}  rule: ${{rule}}  score: ${{score}}"
+if [[ `awk "BEGIN{{print(${{score}}-${{unrule_score}}>0.3)?"1":"0"}}"` = 0 ]]; then
+    mode=1
+else
+    mode=2
+fi
+
+if [[ ${{mode}} = 1 ]]; then
+    rule_parm=""
+else
+    if [[ ${{rule}} = "++,--" || ${{rule}} == "1++,1--,2+-,2-+" ]]; then
+        rule_parm="--rf"
+    else
+        rule_parm="--fr"
+    fi
+fi
+
+stringtie -p 4 ${{rule_parm}} -e -G {input.gtf} -A {output.tab} -o {output.gtf} {input.bam}
+        """
+
+rule taco_merge_stringtie_fpkm:
+    input:
+        [rules.taco_rna_seq_stringtie.output.gtf.format(tp=tp, SRR=SRR) for tp in OVULE_RNA_SEQ_DATA.keys() for SRR in OVULE_RNA_SEQ_DATA[tp]],
+    output:
+        sample_data = os.path.join(RNA_SEQ_BASE, "taco_merge_expr", "sample.FPKM.tsv"),
+        tp_data = os.path.join(RNA_SEQ_BASE, "taco_merge_expr", "TP.FPKM.tsv"),
+        cor_plot = os.path.join(RNA_SEQ_BASE, "taco_merge_expr", "sample.cor.pdf"),
+    params:
+        merge_stringtie_fpkm = "Rscript scripts/stat/merge_stringtie_fpkm.R",
+    run:
+        TPs = ["m3DPA", "m1DPA", "0DPA", "1DPA", "3DPA", "5DPA"]
+        srr_li = list()
+        tp_li = list()
+        file_li = list()
+        for tp in TPs:
+            for srr in OVULE_RNA_SEQ_DATA[tp]:
+                tp_li.append(tp)
+                srr_li.append(srr)
+                file_li.append(rules.taco_rna_seq_stringtie.output.tab.format(tp=tp, SRR=srr))
+        cmd = "{merge_stringtie_fpkm} -i {files} -t {tps} -s {SRRs} --out-data {sample_data} --out-plot {cor_plot} --out-merge {tp_data}".format(
+            files=" ".join(file_li), tps=" ".join(tp_li), SRRs=" ".join(srr_li), **output, **params
+        )
+        shell(cmd)

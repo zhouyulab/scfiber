@@ -1,0 +1,387 @@
+import os
+curDir = os.getcwd()
+include: "MetaInfo.sm.rules"
+include: "annotation.sm.rules"
+include: "SingleCellPreTreatment3.sm.rules"
+include: "RNA_seq.sm.rules"
+###################
+
+scDATA_BASE = os.path.join("analysis_v3", "final_cluster")
+umapSCE = os.path.join(scDATA_BASE, "umapSCE.RData")
+mergeSCE = os.path.join(scDATA_BASE, "mergeSCE.RData")
+cluster = os.path.join(scDATA_BASE, "cluster.tsv")
+
+rule plot_umap_worker:
+    input:
+        umapSCE = umapSCE,
+        mergeSCE = mergeSCE, 
+    output:
+        flag = touch(os.path.join(scDATA_BASE, "UMAP_merge", "{chrom}", "done.flag"))
+    params:
+        plot_umap = "Rscript scripts/utils/plot_umap.R",
+        out_dir = os.path.join(scDATA_BASE, "UMAP_merge", "{chrom}"),
+    shell:
+        """
+{params.plot_umap} {input.umapSCE} {input.mergeSCE} {wildcards.chrom} {params.out_dir}
+        """
+
+rule plot_umap:
+    input:
+        expand(rules.plot_umap_worker.output, chrom=["Ghir_{0}{1:02d}".format(AD, indx) for AD in ["A", "D"] for indx in range(1, 14)])
+
+rule build_SCE_SNN:
+    input:
+        corSCE = umapSCE,
+    output:
+        SNN = os.path.join(scDATA_BASE, "SNN.RData"),
+    params:
+        SNN_D = 50,
+        SNN_K = 50,
+        SNN_TYPE = "rank",
+        Build_SNN_mnn = "Rscript scripts/processing_single_cell/Build_SNN_mnn_expr.R",
+    shell:
+        """
+{params.Build_SNN_mnn} {input.corSCE} {params.SNN_D} {params.SNN_K} {params.SNN_TYPE} {output.SNN}
+        """
+
+
+rule compute_gene_modularity_ratio:
+    input:
+        SNN = rules.build_SCE_SNN.output.SNN,
+        mergeSCE = mergeSCE,
+    output:
+        stat = os.path.join("analysis_v3", "modularity", "{expr_cutoff}", "modularity.tsv"),
+    params:
+        min_cell_cutoff = 100,
+        max_cell_ratio = 0.5,
+        ncore = 80,
+        compute_gene_modularity_ratio = "Rscript scripts/stat/compute_gene_modularity_ratio.R",
+    shell:
+        """
+{params.compute_gene_modularity_ratio} {input.SNN} {input.mergeSCE} \
+    {wildcards.expr_cutoff} {params.min_cell_cutoff} {params.max_cell_ratio} {params.ncore} \
+    {output.stat}
+        """
+
+rule filter_gene_modularity:
+    input:
+        gene_modularity = rules.compute_gene_modularity_ratio.output.stat,
+        corSCE = umapSCE,
+        mergeSCE = mergeSCE,
+        cluster = cluster,
+    output:
+        stat = os.path.join("analysis_v3", "modularity", "{expr_cutoff}", "Modularity.filter.tsv"),
+    params:
+        out_dir = os.path.join("analysis_v3", "modularity", "{expr_cutoff}"),
+        ratio_cutoff = 10,
+        filter_gene_modularity_ratio = "Rscript scripts/stat/filter_gene_modularity_ratio.R",
+    shell:
+        """
+{params.filter_gene_modularity_ratio} {input.gene_modularity} {input.mergeSCE} {input.corSCE} {input.cluster}  {params.ratio_cutoff} {params.out_dir}
+        """
+
+rule modularity:
+    input:
+        expand(rules.filter_gene_modularity.output, expr_cutoff=[2, 5, 10, 20, 50])
+
+MODU_BASE = os.path.join("analysis_v3", "recluster", "modularity_gene_cluster")
+rule modularity_cluster_topGO:
+    input:
+        stat = os.path.join(MODU_BASE, "ModularityEnrichGene.group.tsv"),
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join(MODU_BASE, "topGO.flag")),
+    params:
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+        work_dir = os.path.join(MODU_BASE, "topGO"),
+        top_nodes = 20,
+    run:
+        from pybicl.io import iterline
+        from collections import defaultdict
+        clu_dict = defaultdict(list)
+        for indx, line in enumerate(iterline(input.stat)):
+            if indx == 0:
+                continue
+            gid, clu = line.rstrip("\n").split("\t")
+            if clu == "Outer":
+                continue
+            clu_dict[clu].append(gid)
+
+        for clu, gid_li in clu_dict.items():
+            tmp_dir = os.path.join(params.work_dir, clu)
+            cmd = """
+if [[ -e {dir} ]]; then
+    rm -rf {dir}
+fi
+mkdir -p {dir}
+            """.format(dir=tmp_dir)
+            shell(cmd)
+            f_gene_li = os.path.join(tmp_dir, "gene_li.txt")
+            with open(f_gene_li, "w") as f:
+                for gid in gid_li:
+                    f.write(gid+"\n")
+            cmd = "{run_topgo} --gene-list {gene_li} --background-list {bg_li} --GO-db {godb} --top-nodes {top_nodes} --output {output}".format(run_topgo=params.run_topgo, gene_li=f_gene_li, bg_li=input.topGO_bg, godb=input.topGO_map, top_nodes=params.top_nodes, output=tmp_dir)
+            shell(cmd)
+
+
+rule compute_size_factor:
+    input:
+        mergeSCE = mergeSCE,
+    output:
+        size_factor = os.path.join(scDATA_BASE, "sizeFactor.tsv"),
+    params:
+        job_name = "compute_size_factor",
+        walltime = "480:00:00",
+        nodes = "nodes=1:ppn=1",
+        log = "log",
+        queue = "all",
+        compute_size_factor = "Rscript scripts/processing_single_cell/compute_size_factor.R",
+    shell:
+        """
+{params.compute_size_factor} {input.mergeSCE} {output.size_factor}
+        """
+
+##  Cluster stat  ##
+STAT_BASE = os.path.join("analysis_v3", "stat")
+rule cluster_stat:
+    input:
+        mergeSCE = mergeSCE,
+        cluster = cluster,
+    output:
+        stat = os.path.join(STAT_BASE, "cluster_stat", "Cluster.stat.tsv"),
+    params:
+        output_dir = os.path.join(STAT_BASE, "cluster_stat"),
+        cluster_stat = "Rscript scripts/stat/cluster_stat.R",
+    shell:
+        "{params.cluster_stat} {input.mergeSCE} {input.cluster} {params.output_dir}"
+
+rule cluster_cnt:
+    input:
+        mergeSCE = mergeSCE,
+        cluster = cluster,
+    output:
+        sample_rep_cnt = os.path.join(STAT_BASE, "cluster_cnt", "cluster.rep.cnt.tsv"),
+        sample_cnt = os.path.join(STAT_BASE, "cluster_cnt", "cluster.cnt.tsv"),
+    params:
+        cluster_cnt = "Rscript scripts/stat/cluster_cnt.R",
+    shell:
+        "{params.cluster_cnt} {input.mergeSCE} {input.cluster} {output.sample_rep_cnt} {output.sample_cnt} Cluster"
+
+rule cnt2tpm:
+    input:
+        sample_rep_cnt = rules.cluster_cnt.output.sample_rep_cnt,
+        sample_cnt = rules.cluster_cnt.output.sample_cnt,
+    output:
+        sample_rep_cnt = os.path.join(STAT_BASE, "cluster_cnt", "cluster.rep.tpm.tsv"),
+        sample_cnt = os.path.join(STAT_BASE, "cluster_cnt", "cluster.tpm.tsv"),
+    params:
+        cnt2tpm = "Rscript scripts/stat/cnt2tpm.R",
+    shell:
+        """
+{params.cnt2tpm} {input.sample_rep_cnt} {output.sample_rep_cnt}
+{params.cnt2tpm} {input.sample_cnt} {output.sample_cnt}
+        """
+
+rule plot_SCE_cor:
+    input:
+        cnt = rules.cluster_cnt.output.sample_rep_cnt,
+    output:
+        output_dir = directory(os.path.join(STAT_BASE, "cluster_cor")),
+    params:
+        rep1 = ["rep2"],
+        rep2 = ["rep3"],
+        rep1_name = "10x Genomics v2",
+        rep2_name = "10x Genomics v3",
+        plot_SCE_cor = "Rscript scripts/stat/plot_SCE_cor.R",
+    shell:
+        """
+if [[ -e {output.output_dir} ]]; then
+    rm -r {output.output_dir}
+fi
+mkdir -p {output.output_dir}
+{params.plot_SCE_cor} -i {input.cnt} -o {output.output_dir} \
+    --rep1 {params.rep1} --rep2 {params.rep2} \
+    --rep1-name "{params.rep1_name}" --rep2-name "{params.rep2_name}"
+        """
+
+rule find_marker:
+    input:
+        mergeSCE = mergeSCE,
+        corSCE = umapSCE,
+        tpm = rules.cnt2tpm.output.sample_cnt,
+        cluster = cluster,
+        tf = rules.PlantTFDB2HUA.output.res,
+    output:
+        data = os.path.join(STAT_BASE, "marker_gene", "Marker.gene.tsv"),
+    params:
+        fdr_cutoff = 1e-9,
+        expr_cutoff = 2,
+        bg_ratio = 0.1,
+        ratio_fc = 1.5,
+        mix_expr_ratio_curoff = 0.01,
+        output_dir = os.path.join(STAT_BASE, "marker_gene"),
+        find_marker = "Rscript scripts/stat/find_marker.R",
+    shell:
+        """
+if [[ -e {params.output_dir} ]]; then
+    rm -r {params.output_dir}
+fi
+mkdir -p {params.output_dir}
+{params.find_marker} {input.mergeSCE} {input.corSCE} {input.cluster} {input.tpm} {input.tf} {params.fdr_cutoff} {params.expr_cutoff} {params.bg_ratio} {params.ratio_fc} {params.mix_expr_ratio_curoff} {params.output_dir}
+        """
+
+rule plot_marker_heatmap:
+    input:
+        data = rules.find_marker.output.data,
+        tp_fpkm = rules.taco_merge_stringtie_fpkm.output.tp_data,
+    output:
+        plot = os.path.join(STAT_BASE, "marker_gene", "Marker.heatmap.pdf"),
+    params:
+        plot_marker_heatmap = "Rscript scripts/stat/plot_marker_heatmap.R",
+    shell:
+        "{params.plot_marker_heatmap} {input.data} {input.tp_fpkm} {output.plot}"
+
+rule merker_gene_topGO:
+    input:
+        stat = rules.find_marker.output.data,
+        tf = rules.PlantTFDB2HUA.output.res,
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join(STAT_BASE, "marker_gene", "topGO.flag")),
+    params:
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+        work_dir = os.path.join(STAT_BASE, "marker_gene", "topGO"),
+        tf_work_dir = os.path.join(STAT_BASE, "marker_gene", "topGO_TF"),
+        non_tf_work_dir = os.path.join(STAT_BASE, "marker_gene", "topGO_nTF"),
+        top_nodes = 20,
+    run:
+        from pybicl.io import iterline
+        from collections import defaultdict
+        import time
+        clu_dict = defaultdict(list)
+        for indx, line in enumerate(iterline(input.stat)):
+            if indx == 0:
+                continue
+            clu, gid = line.rstrip("\n").split("\t")[:2]
+            if clu == "Outer":
+                continue
+            clu_dict[clu].append(gid)
+
+        for clu, gid_li in clu_dict.items():
+            tmp_dir = os.path.join(params.work_dir, clu)
+            tmp_tf_dir = os.path.join(params.tf_work_dir, clu)
+            tmp_non_tf_dir = os.path.join(params.non_tf_work_dir, clu)
+            cmd = """
+if [[ -e {dir} ]]; then
+    rm -rf {dir}
+fi
+mkdir -p {dir}
+            """
+            shell(cmd.format(dir=tmp_dir))
+            shell(cmd.format(dir=tmp_tf_dir))
+            shell(cmd.format(dir=tmp_non_tf_dir))
+            f_gene_li = os.path.join(tmp_dir, "gene_li.txt")
+            with open(f_gene_li, "w") as f:
+                for gid in gid_li:
+                    f.write(gid+"\n")
+            time.sleep(0.5)
+            cmd = "cut -f 1 {tf} > {all_dir}/tf.txt".format(tf=input.tf, all_dir=tmp_dir)
+            shell(cmd)
+            cmd = """
+grep -f {all_dir}/tf.txt {all_dir}/gene_li.txt > {tf_dir}/gene_li.txt
+grep -f {all_dir}/tf.txt {bg_li} > {tf_dir}/bg_li.txt""".format(all_dir=tmp_dir, bg_li=input.topGO_bg, tf_dir=tmp_tf_dir)
+            try:
+                shell(cmd)
+            except:
+                pass
+            cmd = """
+grep -v -f {all_dir}/tf.txt {all_dir}/gene_li.txt > {ntf_dir}/gene_li.txt
+grep -v -f {all_dir}/tf.txt {bg_li} > {ntf_dir}/bg_li.txt""".format(all_dir=tmp_dir, bg_li=input.topGO_bg, ntf_dir=tmp_non_tf_dir)
+            try:
+                shell(cmd)
+            except:
+                pass 
+
+            cmd = """
+if [[ -s {gene_li} ]]; then
+    {run_topgo} --gene-list {gene_li} --background-list {bg_li} --GO-db {godb} --top-nodes {top_nodes} --output {output}
+fi
+            """
+            shell(cmd.format(run_topgo=params.run_topgo, gene_li=f_gene_li, bg_li=input.topGO_bg, godb=input.topGO_map, top_nodes=params.top_nodes, output=tmp_dir))
+            shell(cmd.format(run_topgo=params.run_topgo, gene_li=os.path.join(tmp_tf_dir, "gene_li.txt"), bg_li=os.path.join(tmp_tf_dir, "bg_li.txt"), godb=input.topGO_map, top_nodes=params.top_nodes, output=tmp_tf_dir))
+            shell(cmd.format(run_topgo=params.run_topgo, gene_li=os.path.join(tmp_non_tf_dir, "gene_li.txt"), bg_li=os.path.join(tmp_non_tf_dir, "bg_li.txt"), godb=input.topGO_map, top_nodes=params.top_nodes, output=tmp_non_tf_dir))
+
+rule DiffExpr:
+    input:
+        mergeSCE = mergeSCE,
+        corSCE = umapSCE,
+        tpm = rules.cnt2tpm.output.sample_cnt,
+        cluster = cluster,
+    output:
+        res = os.path.join(STAT_BASE, "diff_expr", "DiffExpr.tsv"),
+    params:
+        FC_cutoff = 2,
+        padj_cutoff = 0.05,
+        cell_num_cutoff = 100,
+        out_dir = os.path.join(STAT_BASE, "diff_expr"),
+        diff_expr = "Rscript scripts/stat/diff_expr.R",
+    shell:
+        """
+{params.diff_expr} {input.mergeSCE} {input.corSCE} {input.cluster} {input.tpm} {params.FC_cutoff} {params.padj_cutoff} {params.cell_num_cutoff} {params.out_dir}
+        """
+
+rule plot_diff_expr_C2:
+    input:
+        DE = rules.DiffExpr.output.res,
+        tpm = rules.cnt2tpm.output.sample_cnt,
+        tf = rules.PlantTFDB2HUA.output.res,
+        tp_fpkm = rules.taco_merge_stringtie_fpkm.output.tp_data,
+    output:
+        data = os.path.join(STAT_BASE, "diff_expr", "DiffExpr.C2.Down.tsv"),
+    params:
+        out_dir = os.path.join(STAT_BASE, "diff_expr"),
+        plot_diff_expr_C2 = "Rscript scripts/stat/plot_diff_expr_C2.R",
+    shell:
+        """
+{params.plot_diff_expr_C2} {input.DE} {input.tf} {input.tpm} {input.tp_fpkm} {params.out_dir}
+        """
+
+rule diff_expr_C2_topGO:
+    input:
+        stat = rules.plot_diff_expr_C2.output.data,
+        topGO_map = TOP_GO_MAP,
+        topGO_bg = TOP_GO_BG,
+    output:
+        flag = touch(os.path.join(STAT_BASE, "diff_expr", "DiffExpr.C2.topGO", "topGO.flag")),
+    params:
+        run_topgo = "Rscript scripts/stat/run_topgo.R",
+        work_dir = os.path.join(STAT_BASE, "diff_expr", "DiffExpr.C2.topGO"),
+        top_nodes = 20,
+    shell:
+        """
+all_dir={params.work_dir}/All
+if [[ -e $all_dir ]]; then
+    rm -rf $all_dir
+fi
+mkdir -p $all_dir
+cat {input.stat} | cut -f 1 | sed -n '2,$p' > $all_dir/gene_li.txt
+{params.run_topgo} --gene-list $all_dir/gene_li.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes {params.top_nodes} --output $all_dir
+
+c3_enrich_dir={params.work_dir}/C3.enrich
+if [[ -e $c3_enrich_dir ]]; then
+    rm -rf $c3_enrich_dir
+fi
+mkdir -p $c3_enrich_dir
+cat {input.stat} | grep -e "WT.C3" | cut -f 1  > $c3_enrich_dir/gene_li.txt
+{params.run_topgo} --gene-list $c3_enrich_dir/gene_li.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes {params.top_nodes} --output $c3_enrich_dir
+
+c2_enrich_dir={params.work_dir}/C2.enrich
+if [[ -e $c2_enrich_dir ]]; then
+    rm -rf $c2_enrich_dir
+fi
+mkdir -p $c2_enrich_dir
+cat {input.stat} | grep -e "WT.C2" | cut -f 1  > $c2_enrich_dir/gene_li.txt
+{params.run_topgo} --gene-list $c2_enrich_dir/gene_li.txt --background-list {input.topGO_bg} --GO-db {input.topGO_map} --top-nodes {params.top_nodes} --output $c2_enrich_dir
+        """

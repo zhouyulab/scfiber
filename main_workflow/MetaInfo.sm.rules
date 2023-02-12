@@ -1,0 +1,54 @@
+import os
+
+##  Genome infomation  ##
+GENOME_FA = "data/genome/HAU/Ghirsutum_genome.fasta"
+GENOME_2bit = "data/genome/HAU/Ghirsutum_genome.2bit"
+GENOME_MASK_2bit = "data/genome/HAU/Ghirsutum_genome.masked.2bit"
+CHROM_SIZE = "data/genome/HAU/chrom.sizes"
+REF_GFF = "data/genome/HAU/Ghirsutumv1.1_gene_model.gff3"
+REF_GTF = "data/genome/HAU/Ghirsutumv1.1_gene_model.gtf"
+REF_BED = "data/genome/HAU/Ghirsutumv1.1_gene_model.bed12"
+REF_GENE_BED = "data/genome/HAU/Ghirsutumv1.1_gene_model.gene.bed6"
+REF_CDS_FAA = "data/genome/HAU/Ghirsutum_gene_peptide.fasta"
+SPLIT_FAA_BASE = "data/genome/HAU/split_faa"
+TOP_GO_MAP = "data/genome/HAU/topGo.gene.map"
+TOP_GO_BG = "data/genome/HAU/topGo.bg.gene.txt"
+CPG_ISLAND = "data/genome/HAU/CpG.bed6"
+
+NAU_NBI_CDS_FAA = "data/genome/NAU_NBI/NBI_Gossypium_hirsutum_v1.1.pep.fa"
+NAU_NBI_REF_BED = "data/genome/NAU_NBI/NBI_Gossypium_hirsutum_v1.1.gene.bed12"
+NAU_NBI_GFF = "data/genome/NAU_NBI/NBI_Gossypium_hirsutum_v1.1.gene.gff3"
+
+STAR_INDX = "data/star_indx/gosHir_HUA"
+STAR_INDEX_RRNA = "/home/wangdehe/common/rRNA/star_indx/At"
+BOWTIE2_INDX = "data/bowtie2_indx/gosHir_HUA"
+
+##  Single cell sequence  ##
+SINGLE_CELL_DATA_BASE = os.path.abspath("data/single_cell")
+SAMPLEs = ["WT", "FL"]
+REPs = ["rep2", "rep3"]
+BATCHs = ["v2_lib", "v3_lib"]
+
+##  Software  ##
+CELLRANGER = "/home/wangdehe/software/cellranger-3.1.0/cellranger"
+
+MARKER_GENE = {"MNN": "data/protential_marker_gene.txt", "Seurat":"data/protential_marker_gene.seurat.txt"}
+
+BLAST_DB = {
+    "AT": "/home/wangdehe/common/tair/blastdb/Araport11_pep", 
+    "NR": "/home/wangdehe/common/blastdb/nr"
+    }
+
+TF_list = "/home/wangdehe/common/PlantTFDB/tf_list/gosHir/Ghi_TF_list"
+TF_BINDING_MOTIF = "/home/wangdehe/common/PlantTFDB/tf_binding_motif/gosHir/Ghi_TF_binding_motifs.meme"
+
+##  RNA-seq  ##
+OVULE_RNA_SEQ_BASE = "data/RNA_seq/Ovule"
+OVULE_RNA_SEQ_DATA = {
+    "m3DPA": ["SRR1695181"],
+    "m1DPA": ["SRR1695182", "SRR8079306"],
+    "0DPA": ["SRR1695183"],
+    "1DPA": ["SRR1695184", "SRR2917183", "SRR2917184", "SRR2917185"],
+    "3DPA": ["SRR1695185", "SRR2917186", "SRR2917187", "SRR2917188"],
+    "5DPA": ["SRR8079305"],
+}

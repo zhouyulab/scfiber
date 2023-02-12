@@ -1,0 +1,180 @@
+import os
+curDir = os.getcwd()
+include: "MetaInfo.sm.rules"
+
+###################
+FUNCTIONAL_ANNOTATION_BASE = os.path.join("analysis", "annotation")
+rule blast2At:
+    input:
+        faa = REF_CDS_FAA,
+    output:
+        blast_out = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "At", "At.out"),
+    params:
+        blast_db = BLAST_DB["AT"],
+    shell:
+        "blastp -query {input.faa} -out {output.blast_out} -db {params.blast_db} -evalue 1e-6 -outfmt 5 -num_threads 28"
+
+rule At2TSV:
+    input:
+        blast_out = rules.blast2At.output.blast_out,
+    output:
+        res = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "At", "At.tsv"),
+    params:
+        e_val = 1e-3,
+        identity = 0.3,
+        blastout2ann = "python3 scripts/annotation/blastout2ann.py",
+    shell:
+        """
+source activate py35
+{params.blastout2ann} -i {input.blast_out} -o {output.res} --e-val {params.e_val} --identity {params.identity}
+        """
+
+rule blast2NR:
+    input:
+        faa = os.path.join(SPLIT_FAA_BASE, "{indx}.fa"),
+    output:
+        blast_out = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "NR", "out", "{indx}.out"),
+    params:
+        blast_db = BLAST_DB["NR"],
+    shell:
+        "blastp -query {input.faa} -out {output.blast_out} -db {params.blast_db} -evalue 1e-6 -outfmt 5 -num_threads 28"
+
+rule NR2TSV:
+    input:
+        blast_out = rules.blast2NR.output.blast_out,
+    output:
+        res = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "NR", "out", "{indx}.tsv"),
+    params:
+        e_val = 1e-3,
+        identity = 0.5,
+        blastout2ann = "python3 scripts/annotation/blastout2ann.py",
+    shell:
+        """
+source activate py35
+{params.blastout2ann} -i {input.blast_out} -o {output.res} --e-val {params.e_val} --identity {params.identity}
+        """
+
+rule NR2BLAST2GO:
+    input:
+        blast_out = rules.blast2NR.output.blast_out,
+    output:
+        blast15 = touch(os.path.join(FUNCTIONAL_ANNOTATION_BASE, "NR", "blast14", "{indx}.flag")),
+    params:
+        prefix = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "NR", "blast14", "{indx}"),
+    shell:
+        """
+source activate py35
+Blast5ToBlast14 -i {input.blast_out} -o {params.prefix}
+        """
+
+CDS_FAA_DICT = {"HUA": REF_CDS_FAA, "NUA_NBI": NAU_NBI_CDS_FAA}
+rule build_prot_blast_db:
+    input:
+        cds_faa = lambda wildcards: CDS_FAA_DICT[wildcards.target_genome],
+    output:
+        prot_db = [os.path.join("analysis", "colinear", "blastdb", "{{target_genome}}", "prot.{suffix}").format(suffix=suffix) for suffix in ["phr", "pin", "psq"]],
+    params:
+        outfolder = os.path.join("analysis", "colinear", "blastdb", "{target_genome}"),
+    shell:
+        """
+makeblastdb -in {input.cds_faa} -dbtype prot -title "{wildcards.target_genome} prot" -parse_seqids -out {params.outfolder}/prot
+        """
+
+rule prot_pair_blast:
+    input:
+        faa_query = lambda wildcards: CDS_FAA_DICT[wildcards.query_genome],
+        db_ref = rules.build_prot_blast_db.output,
+    output:
+        blast_out = os.path.join("analysis", "colinear", "prot_pair_blast", "{query_genome}_vs_{target_genome}.blast"),
+    params:
+        blast_db=os.path.join("analysis", "colinear", "blastdb", "{target_genome}", "prot"),
+    shell:
+        "blastp -query {input.faa_query} -out {output.blast_out} -db {params.blast_db} -evalue 1e-6 -outfmt 6 -num_threads 28 -max_hsps 10 -num_descriptions 10"
+
+rule build_mcscan2_gff:
+    input:
+        query_cds = REF_BED,
+        ref_cds = NAU_NBI_REF_BED,
+    output:
+        gff = os.path.join("analysis", "colinear", "mcscan2", "HUA_vs_NUA_NBI", "HUA_vs_NUA_NBI.gff"),
+    shell:
+        """
+cat {input.query_cds} | awk '{{FS=OFS="\t"}}{{print "HUA."$1, $4, $2, $3}}' > {output.gff}.query
+cat {input.ref_cds} | awk '{{FS=OFS="\t"}}{{print "NUA_NBI."$1, $4, $2, $3}}' > {output.gff}.ref
+cat {output.gff}.query {output.gff}.ref > {output.gff}
+rm {output.gff}.query {output.gff}.ref
+        """
+
+rule merge_mcscan2_blast_res:
+    input:
+        blast_out = expand(rules.prot_pair_blast.output.blast_out, query_genome=CDS_FAA_DICT.keys(), target_genome=CDS_FAA_DICT.keys())
+    output:
+        merge = os.path.join("analysis", "colinear", "mcscan2", "HUA_vs_NUA_NBI", "HUA_vs_NUA_NBI.blast"),
+    shell:
+        """
+cat {input.blast_out} > {output.merge}
+        """
+
+rule mcscan2:
+    input:
+        gff = rules.build_mcscan2_gff.output.gff,
+        blast = rules.merge_mcscan2_blast_res.output.merge,
+    output:
+        res = os.path.join("analysis", "colinear", "mcscan2", "HUA_vs_NUA_NBI", "HUA_vs_NUA_NBI.collinearity"),
+    params:
+        curDir = curDir,
+        data_dir = os.path.join("analysis", "colinear", "mcscan2", "HUA_vs_NUA_NBI"),
+        MCScanX = "/home/wangdehe/downloads/MCScanX/MCScanX",
+    shell:
+        """
+cd {params.data_dir}
+{params.MCScanX} {params.curDir}/{params.data_dir}/HUA_vs_NUA_NBI
+        """
+
+rule HUA2NUA_NBI:
+    input:
+        blast = os.path.join("analysis", "colinear", "prot_pair_blast", "HUA_vs_NUA_NBI.blast"),
+    output:
+        good = os.path.join("analysis", "colinear", "prot_pair_blast", "HUA_vs_NUA_NBI.good.blast"),
+        best = os.path.join("analysis", "colinear", "prot_pair_blast", "HUA_vs_NUA_NBI.best.blast"),
+        res = os.path.join("analysis", "colinear", "prot_pair_blast", "HUA2NUA_NBI.tsv"),
+    params:
+        curDir = curDir,
+        identity_cutoff = 90,
+    shell:
+        """
+cat {input.blast} | awk '{{if($3>{params.identity_cutoff}){{print $0}}}}' > {output.good}
+cat {output.good} | sort -k 1,1 -u > {output.best}
+cat <(echo "header") {output.best} | awk '{{FS="[.\t]"; OFS="\t"}}{{print $1, $3}}' | sed -n '2,$p' | sort -u > {output.res}
+        """
+
+rule PlantTFDB2HUA:
+    input:
+        TF_list = TF_list,
+        gene_map = rules.HUA2NUA_NBI.output.res,
+    output:
+        res = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "TF", "TF.gene_list.tsv"),
+    params:
+        PlantTFDB2HUA = "Rscript scripts/annotation/PlantTFDB2HUA.R",
+    shell:
+        """
+{params.PlantTFDB2HUA} {input.gene_map} {input.TF_list} {output.res}
+        """
+
+rule PlantTFDB_find_binding_site:
+    input:
+        meme = "/home/wangdehe/common/PlantTFDB/tf_binding_motif/gosHir/individual/{name}.meme",
+        gene = REF_GENE_BED,
+        genome = GENOME_FA,
+    output:
+        flag = touch(os.path.join(FUNCTIONAL_ANNOTATION_BASE, "TF_binding_site", "{name}", "PlantTFDB_find_binding_site.flag")),
+    params:
+        output_folder = os.path.join(FUNCTIONAL_ANNOTATION_BASE, "TF_binding_site", "{name}"),
+    priority: 100
+    shell:
+        """
+mcast --hardmask --oc {params.output_folder} {input.meme} {input.genome}
+gff2bed < {params.output_folder}/mcast.gff > {params.output_folder}/mcast.bed
+cat {params.output_folder}/mcast.bed | awk '{{FS=OFS="\t"}}{{print $1, $2-2000, $3+2000, $4, $5, $6}}' > {params.output_folder}/mcast.expand_2000.bed
+bedtools intersect -wo -a {params.output_folder}/mcast.expand_2000.bed -b {input.gene} > {params.output_folder}/mcast.protential.tsv
+        """

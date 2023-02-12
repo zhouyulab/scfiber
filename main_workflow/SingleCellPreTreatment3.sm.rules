@@ -1,0 +1,128 @@
+import os
+curDir = os.getcwd()
+include: "BuildNovelAnn.sm.rules"
+CELLRANGER_BASE_v3 = os.path.join("analysis_v3", "cellranger")
+CELLRANGER_INDEX_BASE_v3 = os.path.join(CELLRANGER_BASE_v3, "cellranger_index")
+rule cellranger_index_mkgtf_v3:
+    input:
+        gtf = rules.merge_novel_ann.output.gtf,
+    output:
+        gtf = os.path.join(CELLRANGER_INDEX_BASE_v3, "gene.filtered.gtf"),
+    params:
+        cellranger = CELLRANGER,
+    shell:
+        "{params.cellranger} mkgtf {input.gtf} {output.gtf}"
+
+rule cellranger_index_mkref_v3:
+    input:
+        gtf = rules.cellranger_index_mkgtf_v3.output.gtf,
+        genome_fa = GENOME_FA,
+    output:
+        genome_index = directory(os.path.join(CELLRANGER_INDEX_BASE_v3, "gosHir_HUA")),
+    params:
+        cellranger = CELLRANGER,
+        genome = "gosHir_HUA",
+        index_dir = os.path.join(curDir, CELLRANGER_INDEX_BASE_v3),
+        curDir = curDir,
+    shell:
+        """
+if [[ -e {output.genome_index} ]]; then
+    rm -rf {output.genome_index}
+fi
+cd {params.index_dir}
+{params.cellranger} mkref --genome=gosHir_HUA --fasta={params.curDir}/{input.genome_fa} --genes={params.curDir}/{input.gtf} --nthreads=28
+        """
+
+rule cellranger_count_v3:
+    input:
+        index = rules.cellranger_index_mkref_v3.output.genome_index,
+    output:
+        cnt = os.path.join(CELLRANGER_BASE_v3, "count", "{sample}_{rep}", "outs", "metrics_summary.csv"),
+        molecule_h5 = os.path.join(CELLRANGER_BASE_v3, "count", "{sample}_{rep}", "outs", "molecule_info.h5"),
+        raw_cnt = directory(os.path.join(CELLRANGER_BASE_v3, "count", "{sample}_{rep}", "outs", "raw_feature_bc_matrix")),
+        bam = os.path.join(CELLRANGER_BASE_v3, "count", "{sample}_{rep}", "outs", "possorted_genome_bam.bam"),
+    params:
+        cellranger = CELLRANGER,
+        fastq_dir = SINGLE_CELL_DATA_BASE,
+        count_base = os.path.join(CELLRANGER_BASE_v3, "count"),
+        curDir = curDir,
+    shell:
+        """
+cd {params.curDir}/{params.count_base}
+
+if [[ -e {wildcards.sample}_{wildcards.rep} ]]; then
+    rm -rf {wildcards.sample}_{wildcards.rep}
+fi
+
+{params.cellranger} count \
+    --id={wildcards.sample}_{wildcards.rep} \
+    --transcriptome={params.curDir}/{input.index} \
+    --fastqs={params.fastq_dir}/{wildcards.sample} \
+    --sample={wildcards.sample}_{wildcards.rep}
+        """
+
+
+
+##  Filter  ##
+
+FILTER_BASE_v3 = os.path.join("analysis_v3", "filter")
+UMI_cutoff = {"rep1": 1000, "rep2": 1000, "rep3": 4000}
+rule filter_sample_data_v3:
+    input:
+        raw_cnt = rules.cellranger_count_v3.output.raw_cnt,
+    output:
+        barcode_rank_plot = os.path.join(FILTER_BASE_v3, "filter_count", "{sample}_{rep}", "barcode_rank_plot.png"),
+        filter_plot = os.path.join(FILTER_BASE_v3, "filter_count", "{sample}_{rep}", "filter_plot.png"),
+        filter_mat = directory(os.path.join(FILTER_BASE_v3, "filter_count", "{sample}_{rep}", "filter_feature_bc_matrix")),
+    params:
+        FDR_cutoff = 0.01,
+        UMI_cutoff = lambda wildcards: UMI_cutoff[wildcards.rep],
+        filter_single_cell = "Rscript scripts/processing_single_cell/filter_single_cell_data.R",
+    shell:
+        """
+if [[ -e {output.filter_mat} ]]; then
+    rm -rf {output.filter_mat}
+fi
+{params.filter_single_cell} {input.raw_cnt} {params.FDR_cutoff} {params.UMI_cutoff} {output.filter_mat} {output.barcode_rank_plot} {output.filter_plot}
+        """
+
+MAP_FIND_PARAMS_BASE_v3 = os.path.join("analysis_v3", "find_params", "correction")
+rule mnn_norm_HVG_correction_v3_find_params:
+    input:
+        flag = expand(rules.filter_sample_data_v3.output, sample=SAMPLEs, rep=REPs),
+    output:
+        mergeSCE = os.path.join(MAP_FIND_PARAMS_BASE_v3, "k_mnn_{k_mnn}_sigma_mnn_{sigma_mnn}", "mergeSCE.RData"),
+        corSCE = os.path.join(MAP_FIND_PARAMS_BASE_v3, "k_mnn_{k_mnn}_sigma_mnn_{sigma_mnn}", "corSCE.RData"),
+        noCorSCE = os.path.join(MAP_FIND_PARAMS_BASE_v3, "k_mnn_{k_mnn}_sigma_mnn_{sigma_mnn}", "noCorSCE.RData"),
+    params:
+        hvg_fdr = 0.05,
+        k_mnn = lambda wildcards: wildcards.k_mnn,
+        sigma_mnn = lambda wildcards: wildcards.sigma_mnn,
+        output_dir = os.path.join(MAP_FIND_PARAMS_BASE_v3, "k_mnn_{k_mnn}_sigma_mnn_{sigma_mnn}"),
+        mnn_norm_HVG_correction = "Rscript scripts/processing_single_cell/mnn_norm_HVG_correction_v2.R",
+    run:
+        sample_folder_li = list()
+        sample_li = list()
+        rep_li = list()
+        tect_li = list()
+        for sample in SAMPLEs:
+            for (rep, tect) in list(zip(REPs, BATCHs))[::-1]:
+                f = rules.filter_sample_data_v3.output.filter_mat.format(sample=sample, rep=rep)
+                sample_folder_li.append(f)
+                sample_li.append(sample)
+                rep_li.append(rep)
+                tect_li.append(tect)
+        cmd = """
+if [[ -e {output_dir} ]]; then
+    rm -rf {output_dir}
+fi
+mkdir -p {output_dir}
+{mnn_norm_HVG_correction} -i {input} -s {sample} -r {rep} -t {tect} -o {output_dir} \
+    --hvg-fdr {hvg_fdr} \
+    --k-mnn {k_mnn} --sigma-mnn {sigma_mnn}
+        """.format(
+                input=" ".join(sample_folder_li),  
+                sample=" ".join(sample_li), rep=" ".join(rep_li), tect=" ".join(tect_li), **params
+            )
+        shell(cmd)
+

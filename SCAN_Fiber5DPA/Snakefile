@@ -1,0 +1,228 @@
+import os
+
+SAMPLE_LI = ["RT-P{index}".format(index=x+1) for x in range(50)]
+NGS_REPs = ["rep1", "rep2", "rep3"]
+
+rule trim_A_T:
+    input:
+        fastq = os.path.join("data", "Nanopore", "{sample}_raw.fastq.gz")
+    output:
+        fastq = os.path.join("analysis", "trim", "{sample}.all.fastq.gz")
+    params:
+        min_len = 32,
+    shell:
+        """
+cutadapt -f fastq -O 1 -e 0.1 -a 'AAAAAAAAAAAAAAAAAAAA' -g 'TTTTTTTTTTTTTTTTTTTTTT'  -m {params.min_len} -o {output} {input}
+        """
+
+rule rm_dup:
+    input:
+        fastq = rules.trim_A_T.output,
+    output:
+        fastq = os.path.join("analysis", "trim", "{sample}.rm_dup.fastq.gz")
+    threads: 28
+    shell:
+        """
+seqkit rmdup -s {input.fastq} -o {output.fastq} --threads {threads}
+        """
+
+rule rm_rRNA:
+    input:
+        fastq = os.path.join("analysis", "trim", "{sample}.{rm_dup}.fastq.gz"),
+        rRNA_GENOME_FA = os.path.join("data", "rRNA.GosHir.fasta")
+    output:
+        bam = os.path.join("analysis", "rm_rRNA", "{sample}.{rm_dup}.rRNA.bam"),
+        fastq = os.path.join("analysis", "rm_rRNA", "{sample}.{rm_dup}.unmapped.fastq.gz"),
+    params:
+        fastq = os.path.join("analysis", "rm_rRNA", "{sample}.{rm_dup}.unmapped.fastq"),
+    threads: 28
+    shell:
+        """
+minimap2 -ax splice -ub -k14 --secondary=no -t {threads} {input.rRNA_GENOME_FA} {input.fastq} | samtools view -@ {threads} -bh > {output.bam}
+samtools view -bf 4 {output.bam} | samtools fastq -n - > {params.fastq}
+gzip {params.fastq}
+        """
+
+rule mapping:
+    input:
+        fastq = rules.rm_rRNA.output.fastq,
+        GENOME_FA = os.path.join("data", "genome", "Ghirsutum_genome.fasta"),
+    output:
+        bam = os.path.join("analysis", "mapping", "{sample}.{rm_dup}.sort.bam"),
+    threads: 28
+    shell:
+        """
+minimap2 -ax splice -ub -k14 --secondary=no -t {threads} {input.GENOME_FA} {input.fastq} | samtools view -@ {threads} -bh > {output.bam}.tmp.bam
+samtools sort -@ {threads} -o {output.bam} {output.bam}.tmp.bam
+samtools index {output.bam}
+rm {output.bam}.tmp.bam
+        """
+
+rule feature_counts:
+    input:
+        bam = rules.mapping.output.bam,
+        gtf = os.path.join("data", "genome", "Ghirsutumv1.1_gene_model.gtf"),
+    output:
+        res = os.path.join("analysis", "feature_count", "{sample}.{rm_dup}.featurecount"),
+    threads: 4
+    shell:
+        """
+source activate py35
+featureCounts -M -T {threads} -a {input.gtf} -o {output.res}.fc.out {input.bam}
+cat {output.res}.fc.out | sed -n '3,$p' | awk '{{FS=OFS="\t"}}{{print $1, $7}}' > {output.res}
+rm {output.res}.fc.out
+        """
+
+rule merge_feature_count:
+    input:
+        flag = lambda wildcards: [rules.feature_counts.output.res.format(sample=sample, rm_dup=wildcards.rm_dup) for sample in SAMPLE_LI],
+    output:
+        merge = os.path.join("analysis", "merge_expr", "feature_counts.{rm_dup}.merge.tsv"),
+    params:
+        merge_featurecount = "Rscript scripts/merge_featurecount.R",
+    run:
+        file_li = list()
+        name_li = list()
+        for sample in SAMPLE_LI:
+            file_li.append(rules.feature_counts.output.res.format(sample=sample, rm_dup=wildcards.rm_dup))
+            name_li.append(sample)
+        cmd = "{merge_featurecount} -i {files} --label {name} -o {output}".format(
+            merge_featurecount=params.merge_featurecount,
+            files=" ".join(file_li), name=" ".join(name_li), output=output.merge
+        )
+        shell(cmd)
+
+rule RNA_cutadapt:
+    input:
+        R1 = os.path.join("data", "fiber_NGS", "Fiber.DPA5.{rep}.R1.fq.gz"),
+        R2 = os.path.join("data", "fiber_NGS", "Fiber.DPA5.{rep}.R2.fq.gz"),
+    output:
+        R1 = os.path.join("Fiber_NGS_analysis", "trim", "Fiber.DPA5.{rep}.R1.fastq.gz"),
+        R2 = os.path.join("Fiber_NGS_analysis", "trim", "Fiber.DPA5.{rep}.R2.fastq.gz"),
+    threads: 28
+    shell:
+        """
+cutadapt --cores 28 -a AGATCGGAAGAGC -A AGATCGGAAGAGC -m 40 -o {output.R1} -p {output.R2} {input.R1} {input.R2}
+        """
+
+rule RNA_rm_rRNA:
+    input:
+        fq_R1 = rules.RNA_cutadapt.output.R1,
+        fq_R2 = rules.RNA_cutadapt.output.R2,
+    output:
+        unmap_R1 = os.path.join("Fiber_NGS_analysis", "rm_rRNA", "Fiber.DPA5.{rep}.unmap.R1.fq.gz"),
+        unmap_R2 = os.path.join("Fiber_NGS_analysis", "rm_rRNA", "Fiber.DPA5.{rep}.unmap.R2.fq.gz"),
+    params:
+        mapping_dir = os.path.join("Fiber_NGS_analysis", "rm_rRNA", "Fiber.DPA5.{rep}"),
+        indx = "/data1/zhoulab/dhwang/cotton_Nanopore/data/rRNA_STAR_index",
+    threads: 28
+    shell:
+        """
+if [[ -e {params.mapping_dir} ]]; then
+    rm -r {params.mapping_dir}
+fi
+mkdir -p {params.mapping_dir}
+STAR --runThreadN {threads} \
+    --genomeDir {params.indx} \
+    --readFilesIn {input.fq_R1} {input.fq_R2} \
+    --outFileNamePrefix {params.mapping_dir}/ \
+    --outReadsUnmapped Fastx \
+    --readFilesCommand gunzip -c
+gzip -c {params.mapping_dir}/Unmapped.out.mate1 > {output.unmap_R1}
+gzip -c {params.mapping_dir}/Unmapped.out.mate2 > {output.unmap_R2}
+rm -r {params.mapping_dir}
+        """
+
+rule RNA_STAR:
+    input:
+        fq_R1 = rules.RNA_rm_rRNA.output.unmap_R1,
+        fq_R2 = rules.RNA_rm_rRNA.output.unmap_R2,
+        gtf = os.path.join("data", "genome", "Ghirsutumv1.1_gene_model.gtf"),
+    output:
+        bam = os.path.join("Fiber_NGS_analysis", "STAR", "Fiber.DPA5.{rep}.sort.bam"),
+    params:
+        mapping_dir = os.path.join("Fiber_NGS_analysis", "STAR", "Fiber.DPA5.{rep}"),
+        indx = "/home/wangdehe/project/CottonSCE_TP/data/star_indx/gosHir_HUA",
+    threads: 28
+    shell:
+        """
+if [[ -e {params.mapping_dir} ]]; then
+    rm -r {params.mapping_dir}
+fi
+mkdir -p {params.mapping_dir}
+STAR --runThreadN {threads} \
+    --quantMode TranscriptomeSAM \
+    --genomeDir {params.indx} \
+    --sjdbGTFfile {input.gtf} \
+    --sjdbScore 1 \
+    --outFileNamePrefix {params.mapping_dir}/ \
+    --readFilesIn {input.fq_R1} {input.fq_R2} \
+    --outSAMunmapped Within \
+    --outFilterType BySJout \
+    --outSAMattributes NH HI AS NM MD \
+    --outFilterMultimapNmax 20 \
+    --outFilterMismatchNmax 999 \
+    --outFilterMismatchNoverReadLmax 0.04 \
+    --alignIntronMin 20 \
+    --alignIntronMax 1000000 \
+    --alignMatesGapMax 1000000 \
+    --alignSJoverhangMin 8 \
+    --alignSJDBoverhangMin 1 \
+    --outReadsUnmapped Fastx \
+    --readFilesCommand gunzip -c
+samtools sort -@ {threads} -o {output.bam} {params.mapping_dir}/Aligned.out.sam
+samtools index {output.bam}
+rm {params.mapping_dir}/Aligned.out.sam
+        """
+
+rule RNA_rmDup:
+    input:
+        bam = rules.RNA_STAR.output.bam,
+    output:
+        bam = os.path.join("Fiber_NGS_analysis", "rmDup", "Fiber.DPA5.{rep}.bam"),
+        metrics = os.path.join("Fiber_NGS_analysis", "rmDup", "Fiber.DPA5.{rep}.metrics")
+    shell:
+        """
+source activate py27
+picard MarkDuplicates I={input.bam} O={output.bam} M={output.metrics}
+samtools index {output.bam}
+        """
+
+rule RNA_feature_counts:
+    input:
+        bam = rules.RNA_rmDup.output.bam,
+        gtf = os.path.join("data", "genome", "Ghirsutumv1.1_gene_model.gtf"),
+    output:
+        res = os.path.join("Fiber_NGS_analysis", "feature_count", "Fiber.DPA5.{rep}.featurecount"),
+    threads: 4
+    shell:
+        """
+source activate py35
+featureCounts -M -T {threads} -a {input.gtf} -o {output.res}.fc.out {input.bam}
+cat {output.res}.fc.out | sed -n '3,$p' | awk '{{FS=OFS="\t"}}{{print $1, $7}}' > {output.res}
+rm {output.res}.fc.out
+        """
+
+rule RNA_merge_feature_count:
+    input:
+        flag = lambda wildcards: [rules.RNA_feature_counts.output.res.format(rep=rep) for rep in NGS_REPs],
+    output:
+        merge = os.path.join("Fiber_NGS_analysis", "merge_expr", "Fiber.DPA5.feature_counts.merge.tsv"),
+    params:
+        merge_featurecount = "Rscript scripts/merge_featurecount.R",
+    run:
+        file_li = list()
+        name_li = list()
+        for rep in NGS_REPs:
+            file_li.append(rules.RNA_feature_counts.output.res.format(rep=rep))
+            name_li.append(rep)
+        cmd = "{merge_featurecount} -i {files} --label {name} -o {output}".format(
+            merge_featurecount=params.merge_featurecount,
+            files=" ".join(file_li), name=" ".join(name_li), output=output.merge
+        )
+        shell(cmd)
+
+rule all:
+    input:
+        expand(rules.merge_feature_count.output, rm_dup=["all", "rm_dup"]),
+        rules.RNA_merge_feature_count.output,
