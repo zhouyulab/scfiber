@@ -12,7 +12,7 @@ The analysis workflows were implemented and managed using Snakemake.
 
 ## Reference
 
-Wang et al. Cell-specific Clock Controlled Gene Expression Program Regulates 1 Rhythmic Fiber Cell Growth in Cotton. Accepted in Genome Biology. 2023.
+Wang et al. Cell-specific Clock Controlled Gene Expression Program Regulates Rhythmic Fiber Cell Growth in Cotton. Accepted in Genome Biology 2023.
 
 ## Developers
 
