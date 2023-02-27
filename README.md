@@ -23,5 +23,5 @@ Wang et al. Cell-specific Clock Controlled Gene Expression Program Regulates Rhy
 
 ## LICENSE
 
-* MIT LICENSE
+* MIT LICENSE (see LICENSE.md in this repository)
 
