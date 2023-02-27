@@ -20,3 +20,8 @@ Wang et al. Cell-specific Clock Controlled Gene Expression Program Regulates Rhy
 * Miaomiao Wen <wenmiaomiao@whu.edu.cn>
 * Kun Wang <wangk05@whu.edu.cn>
 * Yu Zhou <yu.zhou@whu.edu.cn>
+
+## LICENSE
+
+* MIT LICENSE
+
